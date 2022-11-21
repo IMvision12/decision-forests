@@ -142,7 +142,7 @@ class TFDFDistributedTest(parameterized.TestCase, tf.test.TestCase):
             num_shards=current_worker.num_workers,
             index=current_worker.worker_idx)
 
-      # TODO(gbm): Remove repeat when possible.
+      # TODO: Remove repeat when possible.
       if infinite:
         dataset = dataset.repeat(None)
 
@@ -162,7 +162,7 @@ class TFDFDistributedTest(parameterized.TestCase, tf.test.TestCase):
       train_dataset_creator = strategy.distribute_datasets_from_function(
           lambda context: dataset_fn(context, seed=111))
 
-      # TODO(gbm): Remove "infinite" when the valuation support finite datasets.
+      # TODO: Remove "infinite" when the valuation support finite datasets.
       valid_dataset_creator = strategy.distribute_datasets_from_function(
           lambda context: dataset_fn(context, seed=222, infinite=True))
       # Note: A distributed dataset cannot be reused twice.
@@ -247,13 +247,12 @@ class TFDFDistributedTest(parameterized.TestCase, tf.test.TestCase):
     return output_paths
 
   @parameterized.named_parameters(
-      ("finite_dataset", True, False),
-      ("infinite_dataset", False, False),
+      ("finite_dataset_without_failures", True, False),
+      ("infinite_dataset_without_failures", False, False),
       ("finite_dataset_with_failures", True, True),
   )
   def test_distributed_training_adult(self, use_finite_dataset,
                                       simulate_failures):
-
     # Split the dataset into multiple files.
     train_path = os.path.join(test_data_path(), "dataset", "adult_train.csv")
     test_path = os.path.join(test_data_path(), "dataset", "adult_test.csv")
@@ -382,11 +381,15 @@ class TFDFDistributedTest(parameterized.TestCase, tf.test.TestCase):
     logging.info("Trained model:")
     model.summary()
 
+    model.save(os.path.join(tmp_path(), "pre_evaluated_model"))
+
     # Non-distributed evaluation of the model.
     model._distribution_strategy = None
     model._cluster_coordinator = None
     evaluation = model.evaluate(dataset_fn(None, [test_path]), return_dict=True)
     logging.info("Evaluation: %s", evaluation)
+
+    model.save(os.path.join(tmp_path(), "post_evaluated_model"))
 
     if use_finite_dataset:
       # The finite dataset approach leads to a better model (model equivalent
@@ -428,6 +431,7 @@ class TFDFDistributedTest(parameterized.TestCase, tf.test.TestCase):
 
     logging.info("Trained model:")
     model.summary()
+    _ = model.make_inspector()
 
     model._distribution_strategy = None
     test_df = pd.read_csv(test_path)

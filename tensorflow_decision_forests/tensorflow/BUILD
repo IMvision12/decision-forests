@@ -62,7 +62,7 @@ cc_library(
     name = "dataset_formats",
     deps = [
         "@ydf//yggdrasil_decision_forests/dataset:csv_example_reader",
-        "@ydf//yggdrasil_decision_forests/dataset:tf_example_io_tfrecord",
+        "@ydf//yggdrasil_decision_forests/dataset/tensorflow:tf_example_io_tfrecord",
         "@ydf//yggdrasil_decision_forests/learner/distributed_decision_tree/dataset_cache:dataset_cache_reader",
     ],
     alwayslink = 1,
@@ -80,10 +80,25 @@ bzl_library(
 # =========
 
 py_library(
+    name = "core_inference",
+    srcs = ["core_inference.py"],
+    srcs_version = "PY3",
+    deps = [
+        # numpy dep,
+        # pandas dep,
+        # TensorFlow Python,
+        "//tensorflow_decision_forests/component/inspector",
+        "@ydf//yggdrasil_decision_forests/dataset:data_spec_py_proto",
+        "@ydf//yggdrasil_decision_forests/model:abstract_model_py_proto",
+    ],
+)
+
+py_library(
     name = "core",
     srcs = ["core.py"],
     srcs_version = "PY3",
     deps = [
+        ":core_inference",
         # numpy dep,
         # pandas dep,
         # TensorFlow Python,
@@ -121,8 +136,19 @@ py_library(
     srcs = ["tf_logging.py"],
     srcs_version = "PY3",
     deps = [
+        # absl/logging dep,
         # TensorFlow Python,
         "//tensorflow_decision_forests/tensorflow/ops/training:op_py",
+    ],
+)
+
+py_library(
+    name = "tf1_compatibility",
+    srcs = ["tf1_compatibility.py"],
+    srcs_version = "PY3",
+    deps = [
+        # TensorFlow Python,
+        # TensorFlow :trackable,
     ],
 )
 

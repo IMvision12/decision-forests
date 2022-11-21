@@ -56,6 +56,7 @@ cc_library(
         ":tf_distribution_common",
         ":op",
         ":tf_distribution_cc_proto",
+        "@com_google_absl//absl/status:statusor",
         "@ydf//yggdrasil_decision_forests/utils:synchronization_primitives",
         "@com_github_tencent_rapidjson//:rapidjson",
         "@ydf//yggdrasil_decision_forests/utils:concurrency",
@@ -92,7 +93,7 @@ cc_library(
     deps = [
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
-        # TODO(gbm): Usepayload on next TF release (introduced on 2021-11-02).
+        # TODO: Usepayload on next TF release (introduced on 2021-11-02).
         # "@org_tensorflow//tensorflow/core/distributed_runtime:error_payloads",
     ],
 )
@@ -166,6 +167,7 @@ cc_library(
         ":tf_distribution_common",
         ":tf_distribution_cc_proto",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@ydf//yggdrasil_decision_forests/utils:concurrency",
         "@ydf//yggdrasil_decision_forests/utils:status_macros",
         "@ydf//yggdrasil_decision_forests/utils:tensorflow",

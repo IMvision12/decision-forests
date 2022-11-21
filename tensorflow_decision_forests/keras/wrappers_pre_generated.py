@@ -30,6 +30,7 @@ from typing import Optional, List, Set
 import tensorflow as tf
 
 from tensorflow_decision_forests.keras import core
+from tensorflow_decision_forests.component.tuner import tuner as tuner_lib
 from yggdrasil_decision_forests.model import abstract_model_pb2  # pylint: disable=unused-import
 from yggdrasil_decision_forests.learner import abstract_learner_pb2
 
@@ -60,9 +61,30 @@ class CartModel(core.CoreModel):
   print(model.summary())
   ```
 
+  Hyper-parameter tuning:
+
+  ```python
+  import tensorflow_decision_forests as tfdf
+  import pandas as pd
+
+  dataset = pd.read_csv("project/dataset.csv")
+  tf_dataset = tfdf.keras.pd_dataframe_to_tf_dataset(dataset, label="my_label")
+
+  tuner = tfdf.tuner.RandomSearch(num_trials=20)
+
+  # Hyper-parameters to optimize.
+  tuner.discret("max_depth", [4, 5, 6, 7])
+
+  model = tfdf.keras.CartModel(tuner=tuner)
+  model.fit(tf_dataset)
+
+  print(model.summary())
+  ```
+
+
   Attributes:
     task: Task to solve (e.g. Task.CLASSIFICATION, Task.REGRESSION,
-      Task.RANKING, Task.CATEGORICAL_UPLIFT).
+      Task.RANKING, Task.CATEGORICAL_UPLIFT, Task.NUMERICAL_UPLIFT).
     features: Specify the list and semantic of the input features of the model.
       If not specified, all the available features will be used. If specified
       and if `exclude_non_specified_features=True`, only the features in
@@ -83,9 +105,10 @@ class CartModel(core.CoreModel):
       identifies queries in a query/document ranking task. The ranking group
       is not added automatically for the set of features if
       `exclude_non_specified_features=false`.
-    uplift_treatment: Only for task=Task.CATEGORICAL_UPLIFT. Name of an integer
-      feature that identifies the treatment in an uplift problem. The value 0 is
-      reserved for the control treatment.
+    uplift_treatment: Only for task=Task.CATEGORICAL_UPLIFT or
+      task=Task.NUMERICAL_UPLIFT. Name of an integer feature that identifies the
+      treatment in an uplift problem. The value 0 is reserved for the control
+      treatment.
     temp_directory: Temporary directory used to store the model Assets after the
       training, and possibly as a work directory during the training. This
       temporary directory is necessary for the model to be exported after
@@ -136,6 +159,19 @@ class CartModel(core.CoreModel):
         (3) Check if the dataset has a large enough batch size (min 100 if the
         dataset contains more than 1k examples or if the number of examples is
         not available) If set to false, do not run any test.
+    tuner: If set, automatically optimize the hyperparameters of the model using
+      this tuner. If the model is trained with distribution (i.e. the model
+      definition is wrapper in a TF Distribution strategy, the tuning is
+      distributed.
+    discretize_numerical_features: If true, discretize all the numerical
+      features before training. Discretized numerical features are faster to
+      train with, but they can have a negative impact on the model quality.
+      Using discretize_numerical_features=True is equivalent as setting the
+      feature semantic DISCRETIZED_NUMERICAL in the `feature` argument. See the
+      definition of DISCRETIZED_NUMERICAL for more details.
+    num_discretize_numerical_bins: Number of bins used when disretizing
+      numerical features. The value `num_discretized_numerical_bins` defined in
+      a `FeatureUsage` (if any) takes precedence.
     allow_na_conditions: If true, the tree training evaluates conditions of the
       type `X is NA` i.e. `X is missing`. Default: False.
     categorical_algorithm: How to learn splits on categorical attributes.
@@ -186,6 +222,12 @@ class CartModel(core.CoreModel):
       the model. See "Generalized Random Forests", Athey et al. In this paper,
       Honest trees are trained with the Random Forest algorithm with a sampling
       without replacement. Default: False.
+    honest_fixed_separation: For honest trees only i.e. honest=true. If true, a
+      new random separation is generated for each tree. If false, the same
+      separation is used for all the trees (e.g., in Gradient Boosted Trees
+      containing multiple trees). Default: False.
+    honest_ratio_leaf_examples: For honest trees only i.e. honest=true. Ratio
+      of examples used to set the leaf values. Default: 0.5.
     in_split_min_examples_check: Whether to check the `min_examples` constraint
       in the split search (i.e. splits leading to one child having less than
       `min_examples` examples are considered invalid) or before the split
@@ -238,6 +280,12 @@ class CartModel(core.CoreModel):
       number_of_input_features x num_candidate_attributes_ratio`. The possible
       values are between ]0, and 1] as well as -1. If not set or equal to -1,
       the `num_candidate_attributes` is used. Default: -1.0.
+    pure_serving_model: Clear the model from any information that is not
+      required for model serving. This includes debugging, model interpretation
+      and other meta-data. The size of the serialized model can be reduced
+      significatively (50% model size reduction is common). This parameter has
+      no impact on the quality, serving speed or RAM usage of model serving.
+      Default: False.
     random_seed: Random seed for the training of the model. Learners are
       expected to be deterministic by the random seed. Default: 123456.
     sorting_strategy: How are sorted the numerical features in order to find
@@ -310,6 +358,9 @@ class CartModel(core.CoreModel):
                max_vocab_count: Optional[int] = 2000,
                try_resume_training: Optional[bool] = True,
                check_dataset: Optional[bool] = True,
+               tuner: Optional[tuner_lib.Tuner] = None,
+               discretize_numerical_features: bool = False,
+               num_discretized_numerical_bins: int = 255,
                allow_na_conditions: Optional[bool] = False,
                categorical_algorithm: Optional[str] = "CART",
                categorical_set_split_greedy_sampling: Optional[float] = 0.1,
@@ -317,6 +368,8 @@ class CartModel(core.CoreModel):
                categorical_set_split_min_item_frequency: Optional[int] = 1,
                growing_strategy: Optional[str] = "LOCAL",
                honest: Optional[bool] = False,
+               honest_fixed_separation: Optional[bool] = False,
+               honest_ratio_leaf_examples: Optional[float] = 0.5,
                in_split_min_examples_check: Optional[bool] = True,
                keep_non_leaf_label_distribution: Optional[bool] = True,
                max_depth: Optional[int] = 16,
@@ -327,6 +380,7 @@ class CartModel(core.CoreModel):
                missing_value_policy: Optional[str] = "GLOBAL_IMPUTATION",
                num_candidate_attributes: Optional[int] = 0,
                num_candidate_attributes_ratio: Optional[float] = -1.0,
+               pure_serving_model: Optional[bool] = False,
                random_seed: Optional[int] = 123456,
                sorting_strategy: Optional[str] = "PRESORT",
                sparse_oblique_normalization: Optional[str] = None,
@@ -354,6 +408,10 @@ class CartModel(core.CoreModel):
             growing_strategy,
         "honest":
             honest,
+        "honest_fixed_separation":
+            honest_fixed_separation,
+        "honest_ratio_leaf_examples":
+            honest_ratio_leaf_examples,
         "in_split_min_examples_check":
             in_split_min_examples_check,
         "keep_non_leaf_label_distribution":
@@ -374,6 +432,8 @@ class CartModel(core.CoreModel):
             num_candidate_attributes,
         "num_candidate_attributes_ratio":
             num_candidate_attributes_ratio,
+        "pure_serving_model":
+            pure_serving_model,
         "random_seed":
             random_seed,
         "sorting_strategy":
@@ -418,7 +478,10 @@ class CartModel(core.CoreModel):
         name=name,
         max_vocab_count=max_vocab_count,
         try_resume_training=try_resume_training,
-        check_dataset=check_dataset)
+        check_dataset=check_dataset,
+        tuner=tuner,
+        discretize_numerical_features=discretize_numerical_features,
+        num_discretized_numerical_bins=num_discretized_numerical_bins)
 
   @staticmethod
   def predefined_hyperparameters() -> List[core.HyperParameterTemplate]:
@@ -451,9 +514,30 @@ class DistributedGradientBoostedTreesModel(core.CoreModel):
   print(model.summary())
   ```
 
+  Hyper-parameter tuning:
+
+  ```python
+  import tensorflow_decision_forests as tfdf
+  import pandas as pd
+
+  dataset = pd.read_csv("project/dataset.csv")
+  tf_dataset = tfdf.keras.pd_dataframe_to_tf_dataset(dataset, label="my_label")
+
+  tuner = tfdf.tuner.RandomSearch(num_trials=20)
+
+  # Hyper-parameters to optimize.
+  tuner.discret("max_depth", [4, 5, 6, 7])
+
+  model = tfdf.keras.DistributedGradientBoostedTreesModel(tuner=tuner)
+  model.fit(tf_dataset)
+
+  print(model.summary())
+  ```
+
+
   Attributes:
     task: Task to solve (e.g. Task.CLASSIFICATION, Task.REGRESSION,
-      Task.RANKING, Task.CATEGORICAL_UPLIFT).
+      Task.RANKING, Task.CATEGORICAL_UPLIFT, Task.NUMERICAL_UPLIFT).
     features: Specify the list and semantic of the input features of the model.
       If not specified, all the available features will be used. If specified
       and if `exclude_non_specified_features=True`, only the features in
@@ -474,9 +558,10 @@ class DistributedGradientBoostedTreesModel(core.CoreModel):
       identifies queries in a query/document ranking task. The ranking group
       is not added automatically for the set of features if
       `exclude_non_specified_features=false`.
-    uplift_treatment: Only for task=Task.CATEGORICAL_UPLIFT. Name of an integer
-      feature that identifies the treatment in an uplift problem. The value 0 is
-      reserved for the control treatment.
+    uplift_treatment: Only for task=Task.CATEGORICAL_UPLIFT or
+      task=Task.NUMERICAL_UPLIFT. Name of an integer feature that identifies the
+      treatment in an uplift problem. The value 0 is reserved for the control
+      treatment.
     temp_directory: Temporary directory used to store the model Assets after the
       training, and possibly as a work directory during the training. This
       temporary directory is necessary for the model to be exported after
@@ -527,6 +612,19 @@ class DistributedGradientBoostedTreesModel(core.CoreModel):
         (3) Check if the dataset has a large enough batch size (min 100 if the
         dataset contains more than 1k examples or if the number of examples is
         not available) If set to false, do not run any test.
+    tuner: If set, automatically optimize the hyperparameters of the model using
+      this tuner. If the model is trained with distribution (i.e. the model
+      definition is wrapper in a TF Distribution strategy, the tuning is
+      distributed.
+    discretize_numerical_features: If true, discretize all the numerical
+      features before training. Discretized numerical features are faster to
+      train with, but they can have a negative impact on the model quality.
+      Using discretize_numerical_features=True is equivalent as setting the
+      feature semantic DISCRETIZED_NUMERICAL in the `feature` argument. See the
+      definition of DISCRETIZED_NUMERICAL for more details.
+    num_discretize_numerical_bins: Number of bins used when disretizing
+      numerical features. The value `num_discretized_numerical_bins` defined in
+      a `FeatureUsage` (if any) takes precedence.
     apply_link_function: If true, applies the link function (a.k.a. activation
       function), if any, before returning the model prediction. If false,
       returns the pre-link function model output.
@@ -572,6 +670,12 @@ class DistributedGradientBoostedTreesModel(core.CoreModel):
       the `num_candidate_attributes` is used. Default: -1.0.
     num_trees: Maximum number of decision trees. The effective number of
       trained tree can be smaller if early stopping is enabled. Default: 300.
+    pure_serving_model: Clear the model from any information that is not
+      required for model serving. This includes debugging, model interpretation
+      and other meta-data. The size of the serialized model can be reduced
+      significatively (50% model size reduction is common). This parameter has
+      no impact on the quality, serving speed or RAM usage of model serving.
+      Default: False.
     random_seed: Random seed for the training of the model. Learners are
       expected to be deterministic by the random seed. Default: 123456.
     shrinkage: Coefficient applied to each tree prediction. A small value
@@ -604,6 +708,9 @@ class DistributedGradientBoostedTreesModel(core.CoreModel):
       max_vocab_count: Optional[int] = 2000,
       try_resume_training: Optional[bool] = True,
       check_dataset: Optional[bool] = True,
+      tuner: Optional[tuner_lib.Tuner] = None,
+      discretize_numerical_features: bool = False,
+      num_discretized_numerical_bins: int = 255,
       apply_link_function: Optional[bool] = True,
       force_numerical_discretization: Optional[bool] = False,
       max_depth: Optional[int] = 6,
@@ -614,6 +721,7 @@ class DistributedGradientBoostedTreesModel(core.CoreModel):
       num_candidate_attributes: Optional[int] = -1,
       num_candidate_attributes_ratio: Optional[float] = -1.0,
       num_trees: Optional[int] = 300,
+      pure_serving_model: Optional[bool] = False,
       random_seed: Optional[int] = 123456,
       shrinkage: Optional[float] = 0.1,
       use_hessian_gain: Optional[bool] = False,
@@ -641,6 +749,8 @@ class DistributedGradientBoostedTreesModel(core.CoreModel):
             num_candidate_attributes_ratio,
         "num_trees":
             num_trees,
+        "pure_serving_model":
+            pure_serving_model,
         "random_seed":
             random_seed,
         "shrinkage":
@@ -673,7 +783,10 @@ class DistributedGradientBoostedTreesModel(core.CoreModel):
         name=name,
         max_vocab_count=max_vocab_count,
         try_resume_training=try_resume_training,
-        check_dataset=check_dataset)
+        check_dataset=check_dataset,
+        tuner=tuner,
+        discretize_numerical_features=discretize_numerical_features,
+        num_discretized_numerical_bins=num_discretized_numerical_bins)
 
   @staticmethod
   def predefined_hyperparameters() -> List[core.HyperParameterTemplate]:
@@ -692,6 +805,7 @@ class GradientBoostedTreesModel(core.CoreModel):
   decision trees trained sequentially. Each tree is trained to predict and then
   "correct" for the errors of the previously trained trees (more precisely each
   tree predict the gradient of the loss relative to the model output).
+  GBTs use [early stopping](early_stopping.md) to avoid overfitting.
 
   Usage example:
 
@@ -708,9 +822,30 @@ class GradientBoostedTreesModel(core.CoreModel):
   print(model.summary())
   ```
 
+  Hyper-parameter tuning:
+
+  ```python
+  import tensorflow_decision_forests as tfdf
+  import pandas as pd
+
+  dataset = pd.read_csv("project/dataset.csv")
+  tf_dataset = tfdf.keras.pd_dataframe_to_tf_dataset(dataset, label="my_label")
+
+  tuner = tfdf.tuner.RandomSearch(num_trials=20)
+
+  # Hyper-parameters to optimize.
+  tuner.discret("max_depth", [4, 5, 6, 7])
+
+  model = tfdf.keras.GradientBoostedTreesModel(tuner=tuner)
+  model.fit(tf_dataset)
+
+  print(model.summary())
+  ```
+
+
   Attributes:
     task: Task to solve (e.g. Task.CLASSIFICATION, Task.REGRESSION,
-      Task.RANKING, Task.CATEGORICAL_UPLIFT).
+      Task.RANKING, Task.CATEGORICAL_UPLIFT, Task.NUMERICAL_UPLIFT).
     features: Specify the list and semantic of the input features of the model.
       If not specified, all the available features will be used. If specified
       and if `exclude_non_specified_features=True`, only the features in
@@ -731,9 +866,10 @@ class GradientBoostedTreesModel(core.CoreModel):
       identifies queries in a query/document ranking task. The ranking group
       is not added automatically for the set of features if
       `exclude_non_specified_features=false`.
-    uplift_treatment: Only for task=Task.CATEGORICAL_UPLIFT. Name of an integer
-      feature that identifies the treatment in an uplift problem. The value 0 is
-      reserved for the control treatment.
+    uplift_treatment: Only for task=Task.CATEGORICAL_UPLIFT or
+      task=Task.NUMERICAL_UPLIFT. Name of an integer feature that identifies the
+      treatment in an uplift problem. The value 0 is reserved for the control
+      treatment.
     temp_directory: Temporary directory used to store the model Assets after the
       training, and possibly as a work directory during the training. This
       temporary directory is necessary for the model to be exported after
@@ -791,6 +927,19 @@ class GradientBoostedTreesModel(core.CoreModel):
         (3) Check if the dataset has a large enough batch size (min 100 if the
         dataset contains more than 1k examples or if the number of examples is
         not available) If set to false, do not run any test.
+    tuner: If set, automatically optimize the hyperparameters of the model using
+      this tuner. If the model is trained with distribution (i.e. the model
+      definition is wrapper in a TF Distribution strategy, the tuning is
+      distributed.
+    discretize_numerical_features: If true, discretize all the numerical
+      features before training. Discretized numerical features are faster to
+      train with, but they can have a negative impact on the model quality.
+      Using discretize_numerical_features=True is equivalent as setting the
+      feature semantic DISCRETIZED_NUMERICAL in the `feature` argument. See the
+      definition of DISCRETIZED_NUMERICAL for more details.
+    num_discretize_numerical_bins: Number of bins used when disretizing
+      numerical features. The value `num_discretized_numerical_bins` defined in
+      a `FeatureUsage` (if any) takes precedence.
     adapt_subsample_for_maximum_training_duration: Control how the maximum
       training duration (if set) is applied. If false, the training stop when
       the time is used. If true, the size of the sampled datasets used train
@@ -851,6 +1000,10 @@ class GradientBoostedTreesModel(core.CoreModel):
       - `LOSS_INCREASE`: Stop the training when the validation does not
         decrease for `early_stopping_num_trees_look_ahead` trees. Default:
         "LOSS_INCREASE".
+    early_stopping_initial_iteration: 0-based index of the first iteration
+      considered for early stopping computation. Increasing this value prevents
+      too early stopping due to noisy initial iterations of the learner.
+      Default: 10.
     early_stopping_num_trees_look_ahead: Rolling number of trees used to detect
       validation loss increase and trigger early stopping. Default: 30.
     focal_loss_alpha: EXPERIMENTAL. Weighting parameter for focal loss,
@@ -890,6 +1043,12 @@ class GradientBoostedTreesModel(core.CoreModel):
       the model. See "Generalized Random Forests", Athey et al. In this paper,
       Honest trees are trained with the Random Forest algorithm with a sampling
       without replacement. Default: False.
+    honest_fixed_separation: For honest trees only i.e. honest=true. If true, a
+      new random separation is generated for each tree. If false, the same
+      separation is used for all the trees (e.g., in Gradient Boosted Trees
+      containing multiple trees). Default: False.
+    honest_ratio_leaf_examples: For honest trees only i.e. honest=true. Ratio
+      of examples used to set the leaf values. Default: 0.5.
     in_split_min_examples_check: Whether to check the `min_examples` constraint
       in the split search (i.e. splits leading to one child having less than
       `min_examples` examples are considered invalid) or before the split
@@ -968,6 +1127,12 @@ class GradientBoostedTreesModel(core.CoreModel):
       the `num_candidate_attributes` is used. Default: -1.0.
     num_trees: Maximum number of decision trees. The effective number of
       trained tree can be smaller if early stopping is enabled. Default: 300.
+    pure_serving_model: Clear the model from any information that is not
+      required for model serving. This includes debugging, model interpretation
+      and other meta-data. The size of the serialized model can be reduced
+      significatively (50% model size reduction is common). This parameter has
+      no impact on the quality, serving speed or RAM usage of model serving.
+      Default: False.
     random_seed: Random seed for the training of the model. Learners are
       expected to be deterministic by the random seed. Default: 123456.
     sampling_method: Control the sampling of the datasets used to train
@@ -1068,6 +1233,9 @@ class GradientBoostedTreesModel(core.CoreModel):
       max_vocab_count: Optional[int] = 2000,
       try_resume_training: Optional[bool] = True,
       check_dataset: Optional[bool] = True,
+      tuner: Optional[tuner_lib.Tuner] = None,
+      discretize_numerical_features: bool = False,
+      num_discretized_numerical_bins: int = 255,
       adapt_subsample_for_maximum_training_duration: Optional[bool] = False,
       allow_na_conditions: Optional[bool] = False,
       apply_link_function: Optional[bool] = True,
@@ -1078,6 +1246,7 @@ class GradientBoostedTreesModel(core.CoreModel):
       compute_permutation_variable_importance: Optional[bool] = False,
       dart_dropout: Optional[float] = 0.01,
       early_stopping: Optional[str] = "LOSS_INCREASE",
+      early_stopping_initial_iteration: Optional[int] = 10,
       early_stopping_num_trees_look_ahead: Optional[int] = 30,
       focal_loss_alpha: Optional[float] = 0.5,
       focal_loss_gamma: Optional[float] = 2.0,
@@ -1086,6 +1255,8 @@ class GradientBoostedTreesModel(core.CoreModel):
       goss_beta: Optional[float] = 0.1,
       growing_strategy: Optional[str] = "LOCAL",
       honest: Optional[bool] = False,
+      honest_fixed_separation: Optional[bool] = False,
+      honest_ratio_leaf_examples: Optional[float] = 0.5,
       in_split_min_examples_check: Optional[bool] = True,
       keep_non_leaf_label_distribution: Optional[bool] = True,
       l1_regularization: Optional[float] = 0.0,
@@ -1102,6 +1273,7 @@ class GradientBoostedTreesModel(core.CoreModel):
       num_candidate_attributes: Optional[int] = -1,
       num_candidate_attributes_ratio: Optional[float] = -1.0,
       num_trees: Optional[int] = 300,
+      pure_serving_model: Optional[bool] = False,
       random_seed: Optional[int] = 123456,
       sampling_method: Optional[str] = "NONE",
       selective_gradient_boosting_ratio: Optional[float] = 0.01,
@@ -1141,6 +1313,8 @@ class GradientBoostedTreesModel(core.CoreModel):
             dart_dropout,
         "early_stopping":
             early_stopping,
+        "early_stopping_initial_iteration":
+            early_stopping_initial_iteration,
         "early_stopping_num_trees_look_ahead":
             early_stopping_num_trees_look_ahead,
         "focal_loss_alpha":
@@ -1157,6 +1331,10 @@ class GradientBoostedTreesModel(core.CoreModel):
             growing_strategy,
         "honest":
             honest,
+        "honest_fixed_separation":
+            honest_fixed_separation,
+        "honest_ratio_leaf_examples":
+            honest_ratio_leaf_examples,
         "in_split_min_examples_check":
             in_split_min_examples_check,
         "keep_non_leaf_label_distribution":
@@ -1189,6 +1367,8 @@ class GradientBoostedTreesModel(core.CoreModel):
             num_candidate_attributes_ratio,
         "num_trees":
             num_trees,
+        "pure_serving_model":
+            pure_serving_model,
         "random_seed":
             random_seed,
         "sampling_method":
@@ -1245,7 +1425,10 @@ class GradientBoostedTreesModel(core.CoreModel):
         name=name,
         max_vocab_count=max_vocab_count,
         try_resume_training=try_resume_training,
-        check_dataset=check_dataset)
+        check_dataset=check_dataset,
+        tuner=tuner,
+        discretize_numerical_features=discretize_numerical_features,
+        num_discretized_numerical_bins=num_discretized_numerical_bins)
 
   @staticmethod
   def predefined_hyperparameters() -> List[core.HyperParameterTemplate]:
@@ -1273,19 +1456,10 @@ class GradientBoostedTreesModel(core.CoreModel):
     return abstract_learner_pb2.LearnerCapabilities(
         support_partial_cache_dataset_format=False)
 
-class RandomForestModel(core.CoreModel):
-  r"""Random Forest learning algorithm.
+class HyperparameterOptimizerModel(core.CoreModel):
+  r"""Hyperparameter Optimizer learning algorithm.
 
-  A Random Forest (https://www.stat.berkeley.edu/~breiman/randomforest2001.pdf)
-  is a collection of deep CART decision trees trained independently and without
-  pruning. Each tree is trained on a random subset of the original training 
-  dataset (sampled with replacement).
   
-  The algorithm is unique in that it is robust to overfitting, even in extreme
-  cases e.g. when there is more features than training examples.
-  
-  It is probably the most well-known of the Decision Forest training
-  algorithms.
 
   Usage example:
 
@@ -1296,15 +1470,36 @@ class RandomForestModel(core.CoreModel):
   dataset = pd.read_csv("project/dataset.csv")
   tf_dataset = tfdf.keras.pd_dataframe_to_tf_dataset(dataset, label="my_label")
 
-  model = tfdf.keras.RandomForestModel()
+  model = tfdf.keras.HyperparameterOptimizerModel()
   model.fit(tf_dataset)
 
   print(model.summary())
   ```
 
+  Hyper-parameter tuning:
+
+  ```python
+  import tensorflow_decision_forests as tfdf
+  import pandas as pd
+
+  dataset = pd.read_csv("project/dataset.csv")
+  tf_dataset = tfdf.keras.pd_dataframe_to_tf_dataset(dataset, label="my_label")
+
+  tuner = tfdf.tuner.RandomSearch(num_trials=20)
+
+  # Hyper-parameters to optimize.
+  tuner.discret("max_depth", [4, 5, 6, 7])
+
+  model = tfdf.keras.HyperparameterOptimizerModel(tuner=tuner)
+  model.fit(tf_dataset)
+
+  print(model.summary())
+  ```
+
+
   Attributes:
     task: Task to solve (e.g. Task.CLASSIFICATION, Task.REGRESSION,
-      Task.RANKING, Task.CATEGORICAL_UPLIFT).
+      Task.RANKING, Task.CATEGORICAL_UPLIFT, Task.NUMERICAL_UPLIFT).
     features: Specify the list and semantic of the input features of the model.
       If not specified, all the available features will be used. If specified
       and if `exclude_non_specified_features=True`, only the features in
@@ -1325,9 +1520,244 @@ class RandomForestModel(core.CoreModel):
       identifies queries in a query/document ranking task. The ranking group
       is not added automatically for the set of features if
       `exclude_non_specified_features=false`.
-    uplift_treatment: Only for task=Task.CATEGORICAL_UPLIFT. Name of an integer
-      feature that identifies the treatment in an uplift problem. The value 0 is
-      reserved for the control treatment.
+    uplift_treatment: Only for task=Task.CATEGORICAL_UPLIFT or
+      task=Task.NUMERICAL_UPLIFT. Name of an integer feature that identifies the
+      treatment in an uplift problem. The value 0 is reserved for the control
+      treatment.
+    temp_directory: Temporary directory used to store the model Assets after the
+      training, and possibly as a work directory during the training. This
+      temporary directory is necessary for the model to be exported after
+      training e.g. `model.save(path)`. If not specified, `temp_directory` is
+      set to a temporary directory using `tempfile.TemporaryDirectory`. This
+      directory is deleted when the model python object is garbage-collected.
+    verbose: Verbosity mode. 0 = silent, 1 = small details, 2 = full details.
+    hyperparameter_template: Override the default value of the hyper-parameters.
+      If None (default) the default parameters of the library are used. If set,
+      `default_hyperparameter_template` refers to one of the following
+      preconfigured hyper-parameter sets. Those sets outperforms the default
+      hyper-parameters (either generally or in specific scenarios).
+      You can omit the version (e.g. remove "@v5") to use the last version of
+      the template. In this case, the hyper-parameter can change in between
+      releases (not recommended for training in production).
+      
+
+    advanced_arguments: Advanced control of the model that most users won't need
+      to use. See `AdvancedArguments` for details.
+    num_threads: Number of threads used to train the model. Different learning
+      algorithms use multi-threading differently and with different degree of
+      efficiency. If `None`, `num_threads` will be automatically set to the
+      number of processors (up to a maximum of 32; or set to 6 if the number of
+      processors is not available).
+      Making `num_threads` significantly larger than the number of processors
+      can slow-down the training speed. The default value logic might change in
+      the future.
+    name: The name of the model.
+    max_vocab_count: Default maximum size of the vocabulary for CATEGORICAL and
+      CATEGORICAL_SET features stored as strings. If more unique values exist,
+      only the most frequent values are kept, and the remaining values are
+      considered as out-of-vocabulary. The value `max_vocab_count` defined in a
+      `FeatureUsage` (if any) takes precedence.
+    try_resume_training: If true, the model training resumes from the checkpoint
+      stored in the `temp_directory` directory. If `temp_directory` does not
+      contain any model checkpoint, the training start from the beginning.
+      Resuming training is useful in the following situations: (1) The training
+        was interrupted by the user (e.g. ctrl+c or "stop" button in a
+        notebook). (2) the training job was interrupted (e.g. rescheduling), ond
+        (3) the hyper-parameter of the model were changed such that an initially
+        completed training is now incomplete (e.g. increasing the number of
+        trees).
+      Note: Training can only be resumed if the training datasets is exactly the
+        same (i.e. no reshuffle in the tf.data.Dataset).
+    check_dataset: If set to true, test if the dataset is well configured for
+      the training: (1) Check if the dataset does contains any `repeat`
+        operations, (2) Check if the dataset does contain a `batch` operation,
+        (3) Check if the dataset has a large enough batch size (min 100 if the
+        dataset contains more than 1k examples or if the number of examples is
+        not available) If set to false, do not run any test.
+    tuner: If set, automatically optimize the hyperparameters of the model using
+      this tuner. If the model is trained with distribution (i.e. the model
+      definition is wrapper in a TF Distribution strategy, the tuning is
+      distributed.
+    discretize_numerical_features: If true, discretize all the numerical
+      features before training. Discretized numerical features are faster to
+      train with, but they can have a negative impact on the model quality.
+      Using discretize_numerical_features=True is equivalent as setting the
+      feature semantic DISCRETIZED_NUMERICAL in the `feature` argument. See the
+      definition of DISCRETIZED_NUMERICAL for more details.
+    num_discretize_numerical_bins: Number of bins used when disretizing
+      numerical features. The value `num_discretized_numerical_bins` defined in
+      a `FeatureUsage` (if any) takes precedence.
+    maximum_model_size_in_memory_in_bytes: Limit the size of the model when
+      stored in ram. Different algorithms can enforce this limit differently.
+      Note that when models are compiled into an inference, the size of the
+      inference engine is generally much smaller than the original model.
+      Default: -1.0.
+    maximum_training_duration_seconds: Maximum training duration of the model
+      expressed in seconds. Each learning algorithm is free to use this
+      parameter at it sees fit. Enabling maximum training duration makes the
+      model training non-deterministic. Default: -1.0.
+    pure_serving_model: Clear the model from any information that is not
+      required for model serving. This includes debugging, model interpretation
+      and other meta-data. The size of the serialized model can be reduced
+      significatively (50% model size reduction is common). This parameter has
+      no impact on the quality, serving speed or RAM usage of model serving.
+      Default: False.
+    random_seed: Random seed for the training of the model. Learners are
+      expected to be deterministic by the random seed. Default: 123456.
+
+  """
+
+  @core._list_explicit_arguments
+  def __init__(self,
+               task: Optional[TaskType] = core.Task.CLASSIFICATION,
+               features: Optional[List[core.FeatureUsage]] = None,
+               exclude_non_specified_features: Optional[bool] = False,
+               preprocessing: Optional["tf.keras.models.Functional"] = None,
+               postprocessing: Optional["tf.keras.models.Functional"] = None,
+               ranking_group: Optional[str] = None,
+               uplift_treatment: Optional[str] = None,
+               temp_directory: Optional[str] = None,
+               verbose: int = 1,
+               hyperparameter_template: Optional[str] = None,
+               advanced_arguments: Optional[AdvancedArguments] = None,
+               num_threads: Optional[int] = None,
+               name: Optional[str] = None,
+               max_vocab_count: Optional[int] = 2000,
+               try_resume_training: Optional[bool] = True,
+               check_dataset: Optional[bool] = True,
+               tuner: Optional[tuner_lib.Tuner] = None,
+               discretize_numerical_features: bool = False,
+               num_discretized_numerical_bins: int = 255,
+               maximum_model_size_in_memory_in_bytes: Optional[float] = -1.0,
+               maximum_training_duration_seconds: Optional[float] = -1.0,
+               pure_serving_model: Optional[bool] = False,
+               random_seed: Optional[int] = 123456,
+               explicit_args: Optional[Set[str]] = None):
+
+    learner_params = {
+        "maximum_model_size_in_memory_in_bytes":
+            maximum_model_size_in_memory_in_bytes,
+        "maximum_training_duration_seconds":
+            maximum_training_duration_seconds,
+        "pure_serving_model":
+            pure_serving_model,
+        "random_seed":
+            random_seed,
+    }
+
+    if hyperparameter_template is not None:
+      learner_params = core._apply_hp_template(
+          learner_params, hyperparameter_template,
+          self.predefined_hyperparameters(), explicit_args)
+
+    super(HyperparameterOptimizerModel, self).__init__(
+        task=task,
+        learner="HYPERPARAMETER_OPTIMIZER",
+        learner_params=learner_params,
+        features=features,
+        exclude_non_specified_features=exclude_non_specified_features,
+        preprocessing=preprocessing,
+        postprocessing=postprocessing,
+        ranking_group=ranking_group,
+        uplift_treatment=uplift_treatment,
+        temp_directory=temp_directory,
+        verbose=verbose,
+        advanced_arguments=advanced_arguments,
+        num_threads=num_threads,
+        name=name,
+        max_vocab_count=max_vocab_count,
+        try_resume_training=try_resume_training,
+        check_dataset=check_dataset,
+        tuner=tuner,
+        discretize_numerical_features=discretize_numerical_features,
+        num_discretized_numerical_bins=num_discretized_numerical_bins)
+
+  @staticmethod
+  def predefined_hyperparameters() -> List[core.HyperParameterTemplate]:
+    return []
+
+  @staticmethod
+  def capabilities() -> abstract_learner_pb2.LearnerCapabilities:
+    return abstract_learner_pb2.LearnerCapabilities(
+        support_partial_cache_dataset_format=False)
+
+class RandomForestModel(core.CoreModel):
+  r"""Random Forest learning algorithm.
+
+  A Random Forest (https://www.stat.berkeley.edu/~breiman/randomforest2001.pdf)
+  is a collection of deep CART decision trees trained independently and without
+  pruning. Each tree is trained on a random subset of the original training 
+  dataset (sampled with replacement).
+  
+  The algorithm is unique in that it is robust to overfitting, even in extreme
+  cases e.g. when there are more features than training examples.
+  
+  It is probably the most well-known of the Decision Forest training
+  algorithms.
+
+  Usage example:
+
+  ```python
+  import tensorflow_decision_forests as tfdf
+  import pandas as pd
+
+  dataset = pd.read_csv("project/dataset.csv")
+  tf_dataset = tfdf.keras.pd_dataframe_to_tf_dataset(dataset, label="my_label")
+
+  model = tfdf.keras.RandomForestModel()
+  model.fit(tf_dataset)
+
+  print(model.summary())
+  ```
+
+  Hyper-parameter tuning:
+
+  ```python
+  import tensorflow_decision_forests as tfdf
+  import pandas as pd
+
+  dataset = pd.read_csv("project/dataset.csv")
+  tf_dataset = tfdf.keras.pd_dataframe_to_tf_dataset(dataset, label="my_label")
+
+  tuner = tfdf.tuner.RandomSearch(num_trials=20)
+
+  # Hyper-parameters to optimize.
+  tuner.discret("max_depth", [4, 5, 6, 7])
+
+  model = tfdf.keras.RandomForestModel(tuner=tuner)
+  model.fit(tf_dataset)
+
+  print(model.summary())
+  ```
+
+
+  Attributes:
+    task: Task to solve (e.g. Task.CLASSIFICATION, Task.REGRESSION,
+      Task.RANKING, Task.CATEGORICAL_UPLIFT, Task.NUMERICAL_UPLIFT).
+    features: Specify the list and semantic of the input features of the model.
+      If not specified, all the available features will be used. If specified
+      and if `exclude_non_specified_features=True`, only the features in
+      `features` will be used by the model. If "preprocessing" is used,
+      `features` corresponds to the output of the preprocessing. In this case,
+      it is recommended for the preprocessing to return a dictionary of tensors.
+    exclude_non_specified_features: If true, only use the features specified in
+      `features`.
+    preprocessing: Functional keras model or @tf.function to apply on the input
+      feature before the model to train. This preprocessing model can consume
+      and return tensors, list of tensors or dictionary of tensors. If
+      specified, the model only "sees" the output of the preprocessing (and not
+      the raw input). Can be used to prepare the features or to stack multiple
+      models on top of each other. Unlike preprocessing done in the tf.dataset,
+      the operation in "preprocessing" are serialized with the model.
+    postprocessing: Like "preprocessing" but applied on the model output.
+    ranking_group: Only for `task=Task.RANKING`. Name of a tf.string feature that
+      identifies queries in a query/document ranking task. The ranking group
+      is not added automatically for the set of features if
+      `exclude_non_specified_features=false`.
+    uplift_treatment: Only for task=Task.CATEGORICAL_UPLIFT or
+      task=Task.NUMERICAL_UPLIFT. Name of an integer feature that identifies the
+      treatment in an uplift problem. The value 0 is reserved for the control
+      treatment.
     temp_directory: Temporary directory used to store the model Assets after the
       training, and possibly as a work directory during the training. This
       temporary directory is necessary for the model to be exported after
@@ -1385,6 +1815,19 @@ class RandomForestModel(core.CoreModel):
         (3) Check if the dataset has a large enough batch size (min 100 if the
         dataset contains more than 1k examples or if the number of examples is
         not available) If set to false, do not run any test.
+    tuner: If set, automatically optimize the hyperparameters of the model using
+      this tuner. If the model is trained with distribution (i.e. the model
+      definition is wrapper in a TF Distribution strategy, the tuning is
+      distributed.
+    discretize_numerical_features: If true, discretize all the numerical
+      features before training. Discretized numerical features are faster to
+      train with, but they can have a negative impact on the model quality.
+      Using discretize_numerical_features=True is equivalent as setting the
+      feature semantic DISCRETIZED_NUMERICAL in the `feature` argument. See the
+      definition of DISCRETIZED_NUMERICAL for more details.
+    num_discretize_numerical_bins: Number of bins used when disretizing
+      numerical features. The value `num_discretized_numerical_bins` defined in
+      a `FeatureUsage` (if any) takes precedence.
     adapt_bootstrap_size_ratio_for_maximum_training_duration: Control how the
       maximum training duration (if set) is applied. If false, the training
       stop when the time is used. If true, adapts the size of the sampled
@@ -1456,6 +1899,12 @@ class RandomForestModel(core.CoreModel):
       the model. See "Generalized Random Forests", Athey et al. In this paper,
       Honest trees are trained with the Random Forest algorithm with a sampling
       without replacement. Default: False.
+    honest_fixed_separation: For honest trees only i.e. honest=true. If true, a
+      new random separation is generated for each tree. If false, the same
+      separation is used for all the trees (e.g., in Gradient Boosted Trees
+      containing multiple trees). Default: False.
+    honest_ratio_leaf_examples: For honest trees only i.e. honest=true. Ratio
+      of examples used to set the leaf values. Default: 0.5.
     in_split_min_examples_check: Whether to check the `min_examples` constraint
       in the split search (i.e. splits leading to one child having less than
       `min_examples` examples are considered invalid) or before the split
@@ -1516,6 +1965,12 @@ class RandomForestModel(core.CoreModel):
     num_trees: Number of individual decision trees. Increasing the number of
       trees can increase the quality of the model at the expense of size,
       training speed, and inference latency. Default: 300.
+    pure_serving_model: Clear the model from any information that is not
+      required for model serving. This includes debugging, model interpretation
+      and other meta-data. The size of the serialized model can be reduced
+      significatively (50% model size reduction is common). This parameter has
+      no impact on the quality, serving speed or RAM usage of model serving.
+      Default: False.
     random_seed: Random seed for the training of the model. Learners are
       expected to be deterministic by the random seed. Default: 123456.
     sampling_with_replacement: If true, the training examples are sampled with
@@ -1596,6 +2051,9 @@ class RandomForestModel(core.CoreModel):
       max_vocab_count: Optional[int] = 2000,
       try_resume_training: Optional[bool] = True,
       check_dataset: Optional[bool] = True,
+      tuner: Optional[tuner_lib.Tuner] = None,
+      discretize_numerical_features: bool = False,
+      num_discretized_numerical_bins: int = 255,
       adapt_bootstrap_size_ratio_for_maximum_training_duration: Optional[
           bool] = False,
       allow_na_conditions: Optional[bool] = False,
@@ -1609,6 +2067,8 @@ class RandomForestModel(core.CoreModel):
       compute_oob_variable_importances: Optional[bool] = False,
       growing_strategy: Optional[str] = "LOCAL",
       honest: Optional[bool] = False,
+      honest_fixed_separation: Optional[bool] = False,
+      honest_ratio_leaf_examples: Optional[float] = 0.5,
       in_split_min_examples_check: Optional[bool] = True,
       keep_non_leaf_label_distribution: Optional[bool] = True,
       max_depth: Optional[int] = 16,
@@ -1621,6 +2081,7 @@ class RandomForestModel(core.CoreModel):
       num_candidate_attributes_ratio: Optional[float] = -1.0,
       num_oob_variable_importances_permutations: Optional[int] = 1,
       num_trees: Optional[int] = 300,
+      pure_serving_model: Optional[bool] = False,
       random_seed: Optional[int] = 123456,
       sampling_with_replacement: Optional[bool] = True,
       sorting_strategy: Optional[str] = "PRESORT",
@@ -1659,6 +2120,10 @@ class RandomForestModel(core.CoreModel):
             growing_strategy,
         "honest":
             honest,
+        "honest_fixed_separation":
+            honest_fixed_separation,
+        "honest_ratio_leaf_examples":
+            honest_ratio_leaf_examples,
         "in_split_min_examples_check":
             in_split_min_examples_check,
         "keep_non_leaf_label_distribution":
@@ -1683,6 +2148,8 @@ class RandomForestModel(core.CoreModel):
             num_oob_variable_importances_permutations,
         "num_trees":
             num_trees,
+        "pure_serving_model":
+            pure_serving_model,
         "random_seed":
             random_seed,
         "sampling_with_replacement":
@@ -1729,7 +2196,10 @@ class RandomForestModel(core.CoreModel):
         name=name,
         max_vocab_count=max_vocab_count,
         try_resume_training=try_resume_training,
-        check_dataset=check_dataset)
+        check_dataset=check_dataset,
+        tuner=tuner,
+        discretize_numerical_features=discretize_numerical_features,
+        num_discretized_numerical_bins=num_discretized_numerical_bins)
 
   @staticmethod
   def predefined_hyperparameters() -> List[core.HyperParameterTemplate]:

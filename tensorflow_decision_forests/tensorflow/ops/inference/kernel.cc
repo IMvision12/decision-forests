@@ -45,6 +45,7 @@
 #include <algorithm>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -67,9 +68,6 @@ namespace model = ::yggdrasil_decision_forests::model;
 namespace utils = ::yggdrasil_decision_forests::utils;
 namespace dataset = ::yggdrasil_decision_forests::dataset;
 namespace serving = ::yggdrasil_decision_forests::serving;
-
-template <typename T>
-using StatusOr = ::yggdrasil_decision_forests::utils::StatusOr<T>;
 
 using Task = model::proto::Task;
 
@@ -189,7 +187,7 @@ tf::Status GetOutputTypesBitmap(const std::vector<std::string>& src_types,
           absl::StrCat("Unknown output types: ", src_type));
     }
   }
-  return tf::Status::OK();
+  return tf::OkStatus();
 }
 
 // Mapping between feature idx (the index used by simpleML to index features),
@@ -233,7 +231,7 @@ class FeatureIndex {
                   feature_spec.name()));
       }
     }
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   const std::vector<int>& numerical_features() const {
@@ -309,7 +307,7 @@ tf::Status ExtractCategoricalSetInt(const InputTensors& inputs,
     }
     (*values)[item_idx] = value;
   }
-  return tf::Status::OK();
+  return tf::OkStatus();
 }
 
 // Wrapping around an inference engine able to run a model.
@@ -327,7 +325,8 @@ class AbstractInferenceEngine {
   };
 
   // Creates a cache: one per inference op instance.
-  virtual StatusOr<std::unique_ptr<AbstractCache>> CreateCache() const = 0;
+  virtual absl::StatusOr<std::unique_ptr<AbstractCache>> CreateCache()
+      const = 0;
 
   // Run the inference of the model and returns its output (e.g. probabilities,
   // logits, regression). The output tensors are already allocated.
@@ -359,7 +358,7 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
     friend GenericInferenceEngine;
   };
 
-  StatusOr<std::unique_ptr<AbstractCache>> CreateCache() const override {
+  absl::StatusOr<std::unique_ptr<AbstractCache>> CreateCache() const override {
     auto cache = absl::make_unique<GenericInferenceEngine::Cache>();
     cache->dataset_.set_data_spec(model_->data_spec());
     RETURN_IF_ERROR(cache->dataset_.CreateColumnsFromDataspec());
@@ -438,7 +437,8 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
               prediction.ranking().relevance();
         } break;
 
-        case Task::CATEGORICAL_UPLIFT: {
+        case Task::CATEGORICAL_UPLIFT:
+        case Task::NUMERICAL_UPLIFT: {
           DCHECK_EQ(outputs->dense_predictions.dimension(1),
                     outputs->output_dim);
           const auto& pred = prediction.uplift();
@@ -461,7 +461,7 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
       }
     }
 
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   tf::Status RunInferenceGetLeaves(
@@ -498,7 +498,7 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
               outputs->num_trees))));
     }
 
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
  private:
@@ -632,7 +632,7 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
       }
     }
 
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   std::unique_ptr<model::AbstractModel> model_;
@@ -643,7 +643,7 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
 // significantly (e.g. up to 20x) faster than "GenericInferenceEngine".
 class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
  public:
-  static StatusOr<std::unique_ptr<SemiFastGenericInferenceEngine>> Create(
+  static absl::StatusOr<std::unique_ptr<SemiFastGenericInferenceEngine>> Create(
       std::unique_ptr<serving::FastEngine> engine,
       const model::AbstractModel& model, const FeatureIndex& feature_index) {
     auto engine_wrapper = absl::WrapUnique(
@@ -666,7 +666,7 @@ class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
     friend SemiFastGenericInferenceEngine;
   };
 
-  StatusOr<std::unique_ptr<AbstractCache>> CreateCache() const override {
+  absl::StatusOr<std::unique_ptr<AbstractCache>> CreateCache() const override {
     auto cache = absl::make_unique<SemiFastGenericInferenceEngine::Cache>();
     cache->examples_ = engine_->AllocateExamples(1);
     cache->num_examples_in_cache_ = 1;
@@ -730,7 +730,7 @@ class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
         }
       }
     }
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   tf::Status RunInferenceGetLeaves(
@@ -754,7 +754,7 @@ class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
         *cache->examples_, inputs.batch_size,
         absl::MakeSpan(outputs->leaves.data(), outputs->leaves.size()))));
 
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
  private:
@@ -927,7 +927,7 @@ class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
       }
     }
 
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   // Inference engine. Contains the model data.
@@ -984,7 +984,7 @@ class YggdrasilModelResource : public tf::ResourceBase {
 
     // WARNING: After this function, the "model" might not be available anymore.
     TF_RETURN_IF_ERROR(CreateInferenceEngine(output_types, std::move(model)));
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   const AbstractInferenceEngine* engine() const {
@@ -1019,7 +1019,7 @@ class YggdrasilModelResource : public tf::ResourceBase {
             utils::FromUtilStatus(inference_engine_or_status.status()));
         inference_engine_ = std::move(inference_engine_or_status.value());
         LOG(INFO) << "Use fast generic engine";
-        return tf::Status::OK();
+        return tf::OkStatus();
       }
     }
 
@@ -1027,7 +1027,7 @@ class YggdrasilModelResource : public tf::ResourceBase {
     LOG(INFO) << "Use slow generic engine";
     inference_engine_ =
         absl::make_unique<GenericInferenceEngine>(std::move(model));
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   // Pre-compute the values returned in the "dense_col_representation" output of
@@ -1056,7 +1056,7 @@ class YggdrasilModelResource : public tf::ResourceBase {
     } else {
       dense_col_representation_.resize(1);
     }
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   // The engine responsible to run the model.
@@ -1098,7 +1098,7 @@ tf::Status GetModelPath(OpKernelContext* ctx, std::string* model_path) {
         kInputPath));
   }
   *model_path = model_paths(0);
-  return tf::Status::OK();
+  return tf::OkStatus();
 }
 
 // Load the model from disk into a resource specified as resource name.
@@ -1287,7 +1287,7 @@ class SimpleMLInferenceOp : public OpKernel {
                        "the \"LoadModel*\" not having been run before."));
     }
 
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   // Computes the batch size from the input feature tensors. Returns an error if
@@ -1316,7 +1316,7 @@ class SimpleMLInferenceOp : public OpKernel {
       }
     }
     *batch_size = max_size;
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 
   // Gets the c++ references on all the input tensor values of the inference op.
@@ -1439,7 +1439,7 @@ class SimpleMLInferenceOp : public OpKernel {
   // Get an engine cache (i.e. a block of working memory necessary for the
   // inference). This engine cache should be returned after usage with
   // "ReturnEngineCache".
-  StatusOr<std::unique_ptr<AbstractInferenceEngine::AbstractCache>>
+  absl::StatusOr<std::unique_ptr<AbstractInferenceEngine::AbstractCache>>
   GetEngineCache() {
     tf::mutex_lock lock_engine_mutex(engine_cache_mutex_);
     if (engine_caches_.empty()) {
@@ -1500,7 +1500,7 @@ class SimpleMLInferenceOpWithHandle : public SimpleMLInferenceOp {
 
   tf::Status LinkModelResource(OpKernelContext* ctx) override {
     TF_RETURN_IF_ERROR(GetModel(ctx, &model_container_));
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 };
 
@@ -1518,7 +1518,7 @@ class SimpleMLInferenceLeafIndexOpWithHandle : public SimpleMLInferenceOp {
 
   tf::Status LinkModelResource(OpKernelContext* ctx) override {
     TF_RETURN_IF_ERROR(GetModel(ctx, &model_container_));
-    return tf::Status::OK();
+    return tf::OkStatus();
   }
 };
 
@@ -1570,7 +1570,7 @@ class SimpleMLCreateModelResource : public OpKernel {
                     container->MemoryUsed() + model_handle_.AllocatedBytes());
               }
               *ret = container;
-              return tf::Status::OK();
+              return tf::OkStatus();
             };
 
     YggdrasilModelResource* model = nullptr;

@@ -56,8 +56,26 @@ py_library(
     deps = [
         ":core",
         # TensorFlow Python,
+        "//tensorflow_decision_forests/component/tuner",
         "@ydf//yggdrasil_decision_forests/learner:abstract_learner_py_proto",
         "@ydf//yggdrasil_decision_forests/model:abstract_model_py_proto",
+    ],
+)
+
+py_library(
+    name = "core_inference",
+    srcs = ["core_inference.py"],
+    srcs_version = "PY3",
+    deps = [
+        # TensorFlow Python,
+        # TensorFlow /distribute:input_lib,
+        "//tensorflow_decision_forests/component/inspector",
+        "//tensorflow_decision_forests/tensorflow:core_inference",
+        "//tensorflow_decision_forests/tensorflow:tf_logging",
+        "//tensorflow_decision_forests/tensorflow/ops/inference:api_py",
+        "@ydf//yggdrasil_decision_forests/learner:abstract_learner_py_proto",
+        "@ydf//yggdrasil_decision_forests/model:abstract_model_py_proto",
+        "@ydf//yggdrasil_decision_forests/utils/distribute/implementations/grpc:grpc_py_proto",
     ],
 )
 
@@ -66,12 +84,14 @@ py_library(
     srcs = ["core.py"],
     srcs_version = "PY3",
     deps = [
+        ":core_inference",
         # TensorFlow Python,
         # TensorFlow /data/ops:dataset_ops,
-        # TensorFlow /training/tracking:base,
+        # TensorFlow /data/ops:load_ops,
         "//tensorflow_decision_forests/component/inspector",
         "//tensorflow_decision_forests/component/tuner",
         "//tensorflow_decision_forests/tensorflow:core",
+        "//tensorflow_decision_forests/tensorflow:tf1_compatibility",
         "//tensorflow_decision_forests/tensorflow:tf_logging",
         "//tensorflow_decision_forests/tensorflow/ops/inference:api_py",
         "//tensorflow_decision_forests/tensorflow/ops/training:op_py",
@@ -132,7 +152,7 @@ py_test(
         # numpy dep,
         # pandas dep,
         # TensorFlow Python,
-        "//third_party/py/tensorflow_decision_forests",
+        "//tensorflow_decision_forests",
     ],
 )
 
@@ -151,6 +171,7 @@ py_test(
     ],
     python_version = "PY3",
     shard_count = 10,
+    tags = ["tfdistributed"],
     deps = [
         # absl/flags dep,
         # absl/logging dep,

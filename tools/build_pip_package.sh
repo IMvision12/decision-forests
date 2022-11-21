@@ -23,22 +23,21 @@
 #   ./tools/build_pip_package.sh python3.8
 #
 #   # Generate the pip package for all the versions of python using pyenv.
-#   # Make sure the package are compatible with manylinux2010.
+#   # Make sure the package are compatible with manylinux2014.
 #   ./tools/build_pip_package.sh ALL_VERSIONS
+#
+#   # Generate the pip package cross-compiled for Apple ARM64 machines
+#   ./tools/build_pip_package.sh MAC_ARM64_CROSS_COMPILED
 #
 # Requirements:
 #
 #   pyenv (if using ALL_VERSIONS_ALREADY_ASSEMBLED or ALL_VERSIONS)
 #     See https://github.com/pyenv/pyenv-installer
+#     Will be installed by this script if INSTALL_PYENV is set to INSTALL_PYENV.
 #
 #   Auditwheel
-#     Note: "libtensorflow_framework.so.2" need to be added to the whitelisted
-#     files (for example, in "policy.json" in "/home/${USER}/.local/lib/
-#     python3.9/site-packages/auditwheel/policy/policy.json").
-#     This change is done automatically (see "patch_auditwell" function). If
-#     the automatic patch does not work, it has to be done manually by adding
-#     "libtensorflow_framework.so.2" next to each "libresolv.so.2" entries
-#     See https://github.com/tensorflow/tensorflow/issues/31807
+#     Auditwheel needs to be version 5.2.0. The script will attempt to
+#     update Auditwheel to this version.
 #
 
 set -xve
@@ -48,35 +47,16 @@ function is_macos() {
   [[ "${PLATFORM}" == "darwin" ]]
 }
 
-# Make sure to use Gnu CP where needed.
-if is_macos; then
-  GCP="gcp"
-else
-  GCP="cp"
-fi
-
 # Temporary directory used to assemble the package.
 SRCPK="$(pwd)/tmp_package"
 
-function patch_auditwell() {
+function check_auditwheel() {
   PYTHON="$1"
   shift
-  # Patch auditwheel for TensorFlow
-  AUDITWHELL_DIR="$(${PYTHON} -m pip show auditwheel | grep "Location:")"
-  AUDITWHELL_DIR="${AUDITWHELL_DIR:10}/auditwheel"
-  echo "Auditwell location: ${AUDITWHELL_DIR}"
-  POLICY_PATH="${AUDITWHELL_DIR}/policy/manylinux-policy.json"
-  TF_DYNAMIC_FILENAME="libtensorflow_framework.so.2"
-  if ! grep -q "${TF_DYNAMIC_FILENAME}" "${POLICY_PATH}"; then
-    echo "Patching Auditwhell"
-    cp "${POLICY_PATH}" "${POLICY_PATH}.orig"
-    if is_macos; then
-      sed -i '' "s/\"libresolv.so.2\"/\"libresolv.so.2\",\"${TF_DYNAMIC_FILENAME}\"/g" "${POLICY_PATH}"
-    else
-      sed -i "s/\"libresolv.so.2\"/\"libresolv.so.2\",\"${TF_DYNAMIC_FILENAME}\"/g" "${POLICY_PATH}"
-    fi
-  else
-    echo "Auditwhell already patched"
+  local auditwheel_version="$(${PYTHON} -m pip show auditwheel | grep "Version:")"
+  if [ "$auditwheel_version" != "Version: 5.2.0" ]; then
+   echo "Auditwheel needs to be Version 5.2.0, currently ${auditwheel_version}"
+   exit 1
   fi
 }
 
@@ -97,7 +77,7 @@ function install_dependencies() {
   ${PYTHON} -m pip install setuptools -U
   ${PYTHON} -m pip install build -U
   ${PYTHON} -m pip install virtualenv -U
-  ${PYTHON} -m pip install auditwheel -U
+  ${PYTHON} -m pip install auditwheel==5.2.0
 }
 
 function check_is_build() {
@@ -121,7 +101,7 @@ function assemble_files() {
   cp ${SRCBIN}/tensorflow/ops/inference/inference.so ${SRCPK}/tensorflow_decision_forests/tensorflow/ops/inference/
   cp ${SRCBIN}/tensorflow/ops/training/training.so ${SRCPK}/tensorflow_decision_forests/tensorflow/ops/training/
 
-  # TODO(gbm): Include when Pip package support distributed training.
+  # TODO: Include when Pip package support distributed training.
   # cp ${SRCBIN}/tensorflow/distribute/distribute.so ${SRCPK}/tensorflow_decision_forests/tensorflow/distribute/
 
   cp ${SRCBIN}/keras/wrappers.py ${SRCPK}/tensorflow_decision_forests/keras/
@@ -136,7 +116,7 @@ function assemble_files() {
   YDFSRCBIN="bazel-bin/external/ydf/yggdrasil_decision_forests"
   mkdir -p ${SRCPK}/yggdrasil_decision_forests
   pushd ${YDFSRCBIN}
-  find . -name \*.py -exec ${GCP} --parents -prv {} ${SRCPK}/yggdrasil_decision_forests \;
+  find . -name \*.py -exec rsync -R -arv {} ${SRCPK}/yggdrasil_decision_forests \;
   popd
 
   # Add __init__.py to all exported Yggdrasil sub-directories.
@@ -157,6 +137,10 @@ function build_package() {
 
 # Tests a pip package.
 function test_package() {
+  if [ ${ARG} == "MAC_ARM64_CROSS_COMPILED" ]; then
+    echo "Cross-compiled packages cannot be tested automatically."
+    return
+  fi
   PYTHON="$1"
   shift
   PACKAGE="$1"
@@ -167,7 +151,7 @@ function test_package() {
   if is_macos; then
     PACKAGEPATH="dist/tensorflow_decision_forests-*-cp${PACKAGE}-cp${PACKAGE}*-*.whl"
   else
-    PACKAGEPATH="dist/tensorflow_decision_forests-*-cp${PACKAGE}-cp${PACKAGE}*-linux_x86_64.whl"
+    PACKAGEPATH="dist/tensorflow_decision_forests-*-cp${PACKAGE}-cp${PACKAGE}*.manylinux2014_x86_64.whl"
   fi
   ${PIP} install ${PACKAGEPATH}
 
@@ -177,6 +161,25 @@ function test_package() {
 
   # Run a small example
   ${PYTHON} examples/minimal.py
+
+  rm -rf previous_package
+  mkdir previous_package
+  ${PYTHON} -m pip download --no-deps -d previous_package tensorflow-decision-forests
+  local old_file_size=`du -k "previous_package" | cut -f1`
+  local new_file_size=`du -k $PACKAGEPATH | cut -f1`
+  local scaled_old_file_size=$(($old_file_size * 12))
+  local scaled_new_file_size=$(($new_file_size * 10))
+  if [ "$scaled_new_file_size" -gt "$scaled_old_file_size" ]; then
+    echo "New package is 20% larger than the previous one."
+    echo "This probably indicates a problem, aborting."
+    exit 1
+  fi
+  scaled_old_file_size=$(($old_file_size * 8))
+  if [ "$scaled_new_file_size" -lt "$scaled_old_file_size" ]; then
+    echo "New package is 20% smaller than the previous one."
+    echo "This probably indicates a problem, aborting."
+    exit 1
+  fi
 }
 
 # Builds and tests a pip package in a given version of python
@@ -186,9 +189,8 @@ function e2e_native() {
   PACKAGE=$(python_to_package_version ${PYTHON})
 
   install_dependencies ${PYTHON}
-  patch_auditwell ${PYTHON}
+  check_auditwheel ${PYTHON}
   build_package ${PYTHON}
-  test_package ${PYTHON} ${PACKAGE}
 
   # Fix package.
   if is_macos; then
@@ -196,13 +198,19 @@ function e2e_native() {
   else
     PACKAGEPATH="dist/tensorflow_decision_forests-*-cp${PACKAGE}-cp${PACKAGE}*-linux_x86_64.whl"
   fi
-  auditwheel repair --plat manylinux2010_x86_64 -w dist ${PACKAGEPATH}
+  TF_DYNAMIC_FILENAME="libtensorflow_framework.so.2"
+  ${PYTHON} -m auditwheel repair --plat manylinux2014_x86_64 -w dist --exclude ${TF_DYNAMIC_FILENAME} ${PACKAGEPATH}
+
+  test_package ${PYTHON} ${PACKAGE}
 }
 
 # Builds and tests a pip package in Pyenv.
 function e2e_pyenv() {
   VERSION="$1"
   shift
+
+  # Don't force updating pyenv, we use a fixed version.
+  # pyenv update
 
   ENVNAME=env_${VERSION}
   pyenv install ${VERSION} -s
@@ -220,7 +228,33 @@ function e2e_pyenv() {
 }
 
 ARG="$1"
+INSTALL_PYENV="$2"
 shift | true
+
+if [ ${INSTALL_PYENV} == "INSTALL_PYENV" ]; then 
+  if ! [ -x "$(command -v pyenv)" ]; then
+    echo "Pyenv not found."
+    echo "Installing build deps, pyenv 2.3.5 and pyenv virtualenv 1.1.5"
+    # Install python dependencies.
+    sudo apt-get update
+    sudo apt-get install -qq make build-essential libssl-dev zlib1g-dev \
+              libbz2-dev libreadline-dev libsqlite3-dev wget curl llvm \
+              libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
+              libffi-dev liblzma-dev patchelf
+    git clone https://github.com/pyenv/pyenv.git
+    (
+      cd pyenv && git checkout bb0f2ae1a7867a06c1692e00efd3abe2113b8f83
+    )
+    PYENV_ROOT="$(pwd)/pyenv"
+    export PATH="$PYENV_ROOT/bin:$PATH"
+    eval "$(pyenv init --path)"
+    eval "$(pyenv init -)"
+    git clone --branch v1.1.5 https://github.com/pyenv/pyenv-virtualenv.git $(pyenv root)/plugins/pyenv-virtualenv
+    eval "$(pyenv init --path)"
+    eval "$(pyenv init -)"
+    eval "$(pyenv virtualenv-init -)"
+  fi
+fi
 
 if [ -z "${ARG}" ]; then
   echo "The first argument should be one of:"
@@ -232,14 +266,23 @@ elif [ ${ARG} == "ALL_VERSIONS" ]; then
   # Compile with all the version of python using pyenv.
   assemble_files
   eval "$(pyenv init -)"
-  e2e_pyenv 3.9.2
-  e2e_pyenv 3.8.7
-  e2e_pyenv 3.7.7
+  e2e_pyenv 3.9.12
+  e2e_pyenv 3.8.13
+  e2e_pyenv 3.7.13
+  e2e_pyenv 3.10.4
 elif [ ${ARG} == "ALL_VERSIONS_ALREADY_ASSEMBLED" ]; then
   eval "$(pyenv init -)"
-  e2e_pyenv 3.9.2
-  e2e_pyenv 3.8.7
-  e2e_pyenv 3.7.7
+  e2e_pyenv 3.9.12
+  e2e_pyenv 3.8.13
+  e2e_pyenv 3.7.13
+  e2e_pyenv 3.10.4
+elif [ ${ARG} == "MAC_ARM64_CROSS_COMPILED" ]; then
+  eval "$(pyenv init -)"
+  assemble_files
+  # Python 3.7 not supported for Mac ARM64
+  e2e_pyenv 3.9.12
+  e2e_pyenv 3.8.13
+  e2e_pyenv 3.10.4
 else
   # Compile with a specific version of python provided in the call arguments.
   assemble_files

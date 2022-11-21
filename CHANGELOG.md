@@ -1,6 +1,62 @@
 # Changelog
 
-## ???? - ????
+## 1.1.0 - 2022-11-18
+
+### Features
+
+-   Support for Tensorflow Serving APIs.
+-   Add support for zipped Yggdrasil Decision Forests model for
+    `yggdrasil_model_to_keras_model`.
+-   Added model prediction tutorial.
+-   Prevent premature stopping of GBT training through new parameter
+    `early_stopping_initial_iteration`.
+
+### Fix
+
+-   Using loaded datasets with TF-DF no longer fails (Github #131).
+-   Automatically infer the semantic of int8 values as numerical (was
+    categorical before).
+-   Build script fixed
+-   Model saving no longer fails when using invalid feature names.
+-   Added keyword to pandas dataset drop (Github #135).
+
+## 1.0.1 - 2022-09-07
+
+### Fix
+
+-   Issue in the application of auditwheel in TF 1.0.0.
+
+## 1.0.0 - 2022-09-07
+
+### Features
+
+-   Add customization of the number of IO threads when using
+    `fit_on_dataset_path`.
+
+### Fix
+
+-   Improved documentation
+-   Improved testing and stability
+
+## 0.2.7 - 2022-06-15
+
+### Features
+
+-   Multithreading of the oblique splitter for gradient boosted tree models.
+-   Support for pure serving model i.e. model containing only serving data.
+-   Add "edit_model" cli tool.
+
+### Fix
+
+-   Remove bias toward low outcome in uplift modeling.
+
+## 0.2.6 - 2022-05-17
+
+### Features
+
+-   Support for TensorFlow 2.9.1
+
+## 0.2.5 - 2022-05-17
 
 ### Features
 

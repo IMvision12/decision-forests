@@ -20,9 +20,8 @@ py_library(
         # TensorFlow Python,
         # TensorFlow :framework_ops,
         # TensorFlow /eager:context,
-        # TensorFlow /training/tracking,
-        # TensorFlow /training/tracking:base,
         "//tensorflow_decision_forests/component/inspector",
+        "//tensorflow_decision_forests/tensorflow:tf1_compatibility",
         "@ydf//yggdrasil_decision_forests/dataset:data_spec_py_proto",
         "@ydf//yggdrasil_decision_forests/model:abstract_model_py_proto",
     ],
@@ -114,6 +113,7 @@ cc_library(
     srcs = ["kernel.cc"],
     deps = [
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@ydf//yggdrasil_decision_forests/dataset:data_spec",
         "@ydf//yggdrasil_decision_forests/dataset:data_spec_cc_proto",

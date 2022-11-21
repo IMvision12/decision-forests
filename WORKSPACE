@@ -11,12 +11,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 # absl used by tensorflow.
 http_archive(
     name = "org_tensorflow",
-    sha256 = "d2948c066a0bc3f45cb8072def03c85f50af8a75606bbdff91715ef8c5f2a28c",
-    strip_prefix = "tensorflow-2.8.0",
-    urls = ["https://github.com/tensorflow/tensorflow/archive/refs/tags/v2.8.0.zip"],
-
-    #urls = ["https://github.com/tensorflow/tensorflow/archive/master.zip"],
-    #strip_prefix = "tensorflow-master",
+    strip_prefix = "tensorflow-2.11.0",
+    sha256 = "e52cda3bae45f0ae0fccd4055e9fa29892b414f70e2df94df9a3a10319c75fff",
+    urls = ["https://github.com/tensorflow/tensorflow/archive/v2.11.0.zip"],
 )
 
 # Inject tensorflow dependencies.
@@ -53,19 +50,12 @@ load("//third_party/absl:workspace.bzl", absl = "deps")
 load("//third_party/benchmark:workspace.bzl", benchmark = "deps")
 load("//third_party/gtest:workspace.bzl", gtest = "deps")
 load("//third_party/protobuf:workspace.bzl", protobuf = "deps")
-load("//third_party/rapidjson:workspace.bzl", rapidjson = "deps")
 
 absl()
-
 absl_py()
-
 benchmark()
-
 gtest()
-
 protobuf()
-
-rapidjson()
 
 # Yggdrasil Decision Forests
 load("//third_party/yggdrasil_decision_forests:workspace.bzl", yggdrasil_decision_forests = "deps")

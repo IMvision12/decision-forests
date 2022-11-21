@@ -38,6 +38,8 @@ upper_tabs:
         path: /decision_forests/tensorflow_serving
       - title: Distributed Training
         path: /decision_forests/distributed_training
+      - title: Runnig models in JavaScript
+        path: https://ydf.readthedocs.io/en/latest/js_serving.html
       - heading: Tutorials
       - title: Overview
         path: /decision_forests/tutorials/index
@@ -45,10 +47,14 @@ upper_tabs:
         path: /decision_forests/tutorials/beginner_colab
       - title: Text and pre-trained embeddings
         path: /decision_forests/tutorials/intermediate_colab
+      - title: Making predictions
+        path: /decision_forests/tutorials/predict_colab
       - title: Inspect and debug
         path: /decision_forests/tutorials/advanced_colab
       - title: Model composition
         path: /decision_forests/tutorials/model_composition_colab
+      - title: Automatic tuning
+        path: /decision_forests/tutorials/automatic_tuning_colab
       - title: Proximities and Prototypes
         path: /decision_forests/tutorials/proximities_colab
       - heading: Developer
