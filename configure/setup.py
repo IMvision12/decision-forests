@@ -21,7 +21,7 @@ import setuptools
 from setuptools.command.install import install
 from setuptools.dist import Distribution
 
-_VERSION = "1.1.0"
+_VERSION = "1.3.0"
 
 with open("README.md", "r", encoding="utf-8") as fh:
   long_description = fh.read()
@@ -29,7 +29,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 REQUIRED_PACKAGES = [
     "numpy",
     "pandas",
-    "tensorflow~=2.11.0",
+    "tensorflow~=2.12.0",
     "six",
     "absl_py",
     "wheel",
@@ -65,12 +65,11 @@ try:
     def get_tag(self):
       python, abi, plat = _bdist_wheel.get_tag(self)
       if platform.system() == "Darwin":
-        # TODO Remove this hard-coded value and automate arm64
-        # switch.
-        #
-        # Uncomment for cross-compiled arm64 switches and comment the next line.
+        # Uncomment on of the lines below to adapt the platform string when 
+        # cross-compiling.
         # plat = "macosx_12_0_arm64"
-        plat = "macosx_10_14_x86_64"
+        # plat = "macosx_10_14_x86_64"
+        pass
       return python, abi, plat
 
 except ImportError:
@@ -98,7 +97,6 @@ setuptools.setup(
         "Intended Audience :: Science/Research",
         "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
@@ -112,7 +110,7 @@ setuptools.setup(
     ],
     distclass=BinaryDistribution,
     packages=setuptools.find_packages(),
-    python_requires=">=3.6",
+    python_requires=">=3.8",
     license="Apache 2.0",
     keywords="tensorflow tensor machine learning decision forests random forest gradient boosted decision trees",
     install_requires=REQUIRED_PACKAGES,

@@ -20,27 +20,33 @@
 #  RUN_TESTS: Run the unit tests e.g. 0 or 1.
 #  PY_VERSION: Version of Python to be used, must be at least 3.7
 #  STARTUP_FLAGS: Any flags given to bazel on startup
-#  TF_VERSION: Tensorflow version to use or "nightly"
+#  TF_VERSION: Tensorflow version to use or "nightly".
+#              For MacOS builds, use "mac-arm64" to build for Apple Silicon on an Apple Silicon machine
+#              and use "mac-intel-crosscompile" to build for Intel CPUs on an Apple Silicon machine.
+#              Tests will not work when cross-compiling (obviously).
+# FULL_COMPILATION: If 1, compile all parts of TF-DF. This may take a long time.
 #
 # Usage example
 #
-#   RUN_TESTS=1 PY_VERSION=3.8 TF_VERSION=2.11.0 ./tools/test_bazel.sh
+#   RUN_TESTS=1 PY_VERSION=3.8 TF_VERSION=2.12.0 ./tools/test_bazel.sh
 
 set -vex
 
 # Version of Python
-# Needs to be >=python3.7
+# Needs to be >=python3.7 (3.8 on MacOS systems)
 PYTHON=python${PY_VERSION}
 
 # Install Pip dependencies
 ${PYTHON} -m ensurepip --upgrade || true
 ${PYTHON} -m pip install pip setuptools --upgrade
-${PYTHON} -m pip install numpy pandas scikit-learn --upgrade
+${PYTHON} -m pip install numpy pandas scikit-learn jax jaxlib --upgrade
 
 # Install Tensorflow at the chosen version.
 if [ ${TF_VERSION} == "nightly" ]; then
   ${PYTHON} -m pip install tf-nightly --force-reinstall
 elif [ ${TF_VERSION} == "mac-arm64" ]; then
+  ${PYTHON} -m pip install tensorflow-macos --force-reinstall
+elif [ ${TF_VERSION} == "mac-intel-crosscompile" ]; then
   ${PYTHON} -m pip install tensorflow-macos --force-reinstall
 else
   ${PYTHON} -m pip install tensorflow==${TF_VERSION} --force-reinstall
@@ -51,8 +57,8 @@ pip list
 
 # Get the commit SHA
 short_commit_sha=$(${PYTHON} -c 'import tensorflow as tf; print(tf.__git_version__)' | tail -1 | grep -o "\-g[0-9a-f]*" | cut -c 3-)
-commit_sha=$(curl -SsL https://github.com/tensorflow/tensorflow/commit/${short_commit_sha} | grep sha-block | grep commit | sed -e 's/.*\([a-f0-9]\{40\}\).*/\1/')
-
+# Grep will close the pipe before curl is finished, which creates an error we ignore.
+commit_sha=$(curl -SsL https://github.com/tensorflow/tensorflow/commit/${short_commit_sha} 2>/dev/null |  grep -o -m 1 $short_commit_sha'\([0-9]\|[a-f]\)\{29\}')
 # Update TF dependency to the chosen version
 sed -i'.bak' -e "s/strip_prefix = \"tensorflow-2\.[0-9]\+\.[0-9]\+\(-rc[0-9]\+\)\?\",/strip_prefix = \"tensorflow-${commit_sha}\",/" WORKSPACE
 sed -i'.bak' -e "s|\"https://github.com/tensorflow/tensorflow/archive/v.\+\.zip\"|\"https://github.com/tensorflow/tensorflow/archive/${commit_sha}.zip\"|" WORKSPACE
@@ -94,17 +100,33 @@ else
 fi
 
 if [ ${TF_VERSION} == "mac-arm64" ]; then
-  mkdir "tf_dep"
+  TFDF_TMPDIR="${TMPDIR}tf_dep"
+  rm -rf ${TFDF_TMPDIR}
+  mkdir -p ${TFDF_TMPDIR}
   # Download the arm64 Tensorflow package
-  pip download --no-deps --platform=macosx_12_0_arm64 --dest=tf_dep tensorflow-macos
-  unzip tf_dep/tensorflow_macos* -d tf_dep
+  pip download --no-deps --platform=macosx_12_0_arm64 --dest=$TFDF_TMPDIR tensorflow-macos
+  unzip -q $TFDF_TMPDIR/tensorflow_macos* -d $TFDF_TMPDIR
 
   # Find the path to the pre-compiled version of TensorFlow installed in the
   # "tensorflow" pip package.
-  SHARED_LIBRARY_DIR=$(readlink -f tf_dep/tensorflow)
+  SHARED_LIBRARY_DIR=$(readlink -f $TFDF_TMPDIR/tensorflow)
   SHARED_LIBRARY_NAME="libtensorflow_framework.dylib"
 
-  HEADER_DIR=$(readlink -f tf_dep/tensorflow/include)
+  HEADER_DIR=$(readlink -f $TFDF_TMPDIR/tensorflow/include)
+elif [ ${TF_VERSION} == "mac-intel-crosscompile" ]; then
+  TFDF_TMPDIR="${TMPDIR}tf_dep"
+  rm -rf ${TFDF_TMPDIR}
+  mkdir -p ${TFDF_TMPDIR}
+  # Download the Intel CPU Tensorflow package
+  pip download --no-deps --platform=macosx_10_14_x86_64 --dest=$TFDF_TMPDIR tensorflow
+  unzip -q $TFDF_TMPDIR/tensorflow* -d $TFDF_TMPDIR
+
+  # Find the path to the pre-compiled version of TensorFlow installed in the
+  # "tensorflow" pip package.
+  SHARED_LIBRARY_DIR=$(readlink -f $TFDF_TMPDIR/tensorflow)
+  SHARED_LIBRARY_NAME="libtensorflow_framework.dylib"
+
+  HEADER_DIR=$(readlink -f $TFDF_TMPDIR/tensorflow/include)
 else
 # Find the path to the pre-compiled version of TensorFlow installed in the
 # "tensorflow" pip package.
@@ -142,27 +164,27 @@ STARTUP_FLAGS="${STARTUP_FLAGS} --bazelrc=${TENSORFLOW_BAZELRC}"
 #
 # FLAGS="$FLAGS --config=rbe_cpu_linux --config=tensorflow_testing_rbe_linux --config=rbe_linux_py3"
 
-# Minimal rules to create and test the Pip Package.
-#
-# Only require a small amount of TF to be compiled.
-BUILD_RULES="//tensorflow_decision_forests/component/...:all //tensorflow_decision_forests/contrib/...:all //tensorflow_decision_forests/keras //tensorflow_decision_forests/keras:grpc_worker_main"
-TEST_RULES="//tensorflow_decision_forests/component/...:all //tensorflow_decision_forests/contrib/...:all //tensorflow_decision_forests/keras/...:all"
+if [ ${TF_VERSION} == "mac-intel-crosscompile" ]; then
+  # Using darwin_x86_64 fails here, tensorflow expects "darwin".
+  FLAGS="${FLAGS} --cpu=darwin --apple_platform_type=macos"
+fi
 
+if [ "${FULL_COMPILATION}" = 1 ]; then
+  BUILD_RULES="//tensorflow_decision_forests/...:all"
+  TEST_RULES="//tensorflow_decision_forests/...:all"
+else
+  BUILD_RULES="//tensorflow_decision_forests/component/...:all //tensorflow_decision_forests/contrib/...:all //tensorflow_decision_forests/keras //tensorflow_decision_forests/keras:grpc_worker_main"
+  TEST_RULES="//tensorflow_decision_forests/component/...:all //tensorflow_decision_forests/contrib/...:all //tensorflow_decision_forests/keras/...:all"
+fi
 
-# All the build rules.
-#
-# BUILD_RULES="//tensorflow_decision_forests/...:all"
-# TEST_RULES="//tensorflow_decision_forests/...:all"
-
-# Tests when distribution strategy is enabled.
-# TEST_RULES="${TEST_RULES} //tensorflow_decision_forests/keras:keras_distributed_test"
+ls -l -a
 
 # Build library
-time ${BAZEL} ${STARTUP_FLAGS} build ${BUILD_RULES} ${FLAGS} --build_tag_filters=-tfdistributed
+time ${BAZEL} ${STARTUP_FLAGS} build ${BUILD_RULES} ${FLAGS}
 
 # Unit test library
 if [ "${RUN_TESTS}" = 1 ]; then
-  time ${BAZEL} ${STARTUP_FLAGS} test ${TEST_RULES} ${FLAGS} --test_size_filters=small,medium,large --test_tag_filters=-tfdistributed
+  time ${BAZEL} ${STARTUP_FLAGS} test ${TEST_RULES} ${FLAGS} --flaky_test_attempts=1 --test_size_filters=small,medium,large
 fi
 
 # Example of dependency check.

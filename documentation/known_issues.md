@@ -46,8 +46,9 @@ The following table shows the compatibility between
 `tensorflow_decision_forests` and its dependencies:
 
 tensorflow_decision_forests | tensorflow
---------------------------- | ----------
-1.1.0                       | 2.11.0
+--------------------------- | ---------------
+1.3.0                       | 2.12.0
+1.1.0 - 1.2.0               | 2.11.0
 1.0.0 - 1.0.1               | 2.10.0 - 2.10.1
 0.2.6 - 0.2.7               | 2.9.1
 0.2.5                       | 2.9
@@ -94,3 +95,8 @@ example, if a `float64` feature is fed to a model expecting a `float32` feature,
 this conversion is performed implicitly. However, such a conversion is not
 possible for models loaded from disk. It is therefore important that the
 training data and the inference data always have the exact same type.
+
+## Tensorflow feature name sanitization
+
+Tensorflow sanitizes feature names and might, for instance, convert them to
+lowercase.

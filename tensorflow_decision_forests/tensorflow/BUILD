@@ -13,6 +13,7 @@ cc_library(
     name = "canonical_models",
     deps = [
         "@ydf//yggdrasil_decision_forests/model/gradient_boosted_trees",
+        "@ydf//yggdrasil_decision_forests/model/multitasker",
         "@ydf//yggdrasil_decision_forests/model/random_forest",
         "@ydf//yggdrasil_decision_forests/serving/decision_forest:register_engines",
     ],
@@ -27,6 +28,7 @@ cc_library(
         "@ydf//yggdrasil_decision_forests/learner/distributed_gradient_boosted_trees",
         "@ydf//yggdrasil_decision_forests/learner/gradient_boosted_trees",
         "@ydf//yggdrasil_decision_forests/learner/hyperparameters_optimizer",
+        "@ydf//yggdrasil_decision_forests/learner/multitasker",
         "@ydf//yggdrasil_decision_forests/learner/random_forest",
     ],
     alwayslink = 1,
@@ -35,22 +37,10 @@ cc_library(
 # Available engines for distributed training.
 cc_library(
     name = "distribution_engines",
-    deps = ["@ydf//yggdrasil_decision_forests/utils/distribute"] +
-           select({
-               "//tensorflow_decision_forests:disable_tf_ps_distribution_strategy": [],
-               "//conditions:default": [
-                   # Distributed training with TF Parameter Server.
-                   #
-                   # If not registered, the following error will be raised
-                   # when using distributed training with the TF PS and TF-DF:
-                   # "Unknown item TF_DIST in class pool".
-                   #
-                   # Currently, this distribution engine is not available in custom
-                   # non-core c++ ops in TF OSS (i.e. when TF-DF is compiled as a shared library).
-                   # Either use monolithic build for TF+TF-DF, or use the GRPC distribution strategy.
-                   "//tensorflow_decision_forests/tensorflow/distribute:tf_distribution",
-               ],
-           }),
+    deps = [
+        "@ydf//yggdrasil_decision_forests/utils/distribute",
+        "@ydf//yggdrasil_decision_forests/utils/distribute:all_workers",
+    ],
     alwayslink = 1,
 )
 
@@ -105,21 +95,16 @@ py_library(
         # TensorFlow /distribute:distribute_lib,
         # TensorFlow /distribute:parameter_server_strategy_v2,
         # TensorFlow /distribute/coordinator:cluster_coordinator,
-        "//tensorflow_decision_forests/component/py_tree",
+        # TensorFlow /distribute/coordinator:coordinator_context,
         "//tensorflow_decision_forests/component/inspector",
-        "//tensorflow_decision_forests/tensorflow/distribute:tf_distribution_py_proto",
+        "//tensorflow_decision_forests/component/py_tree",
         "//tensorflow_decision_forests/tensorflow/ops/training:op_py",
         "@ydf//yggdrasil_decision_forests/dataset:data_spec_py_proto",
         "@ydf//yggdrasil_decision_forests/learner:abstract_learner_py_proto",
         "@ydf//yggdrasil_decision_forests/model:abstract_model_py_proto",
         "@ydf//yggdrasil_decision_forests/model:hyperparameter_py_proto",
-    ] + select({
-        "//tensorflow_decision_forests:disable_tf_ps_distribution_strategy": [],
-        "//conditions:default": [
-            # TensorFlow /distribute/coordinator:coordinator_context,
-            "//tensorflow_decision_forests/tensorflow/distribute:op_py",  # Compatibility with TF Parameter Server for distribution.
-        ],
-    }),
+        "@ydf//yggdrasil_decision_forests/utils/distribute/implementations/grpc:grpc_py_proto",
+    ],
 )
 
 py_library(
@@ -137,6 +122,16 @@ py_library(
     srcs_version = "PY3",
     deps = [
         # absl/logging dep,
+        # TensorFlow Python,
+    ],
+)
+
+py_library(
+    name = "cc_logging",
+    srcs = ["cc_logging.py"],
+    srcs_version = "PY3",
+    deps = [
+        ":tf_logging",
         # TensorFlow Python,
         "//tensorflow_decision_forests/tensorflow/ops/training:op_py",
     ],

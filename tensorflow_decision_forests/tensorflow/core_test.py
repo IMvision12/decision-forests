@@ -128,7 +128,8 @@ class SimpleMlTfTest(tf.test.TestCase):
     self.assertEqual(e_1.tensor.dtype, tf.float32)
 
   def test_normalize_inputs_regexp(self):
-    self.assertEqual(core.normalize_inputs_regexp("e"), r"^e(\.[0-9]+)?$")
+    self.assertEqual(core.normalize_inputs_regexp("e", True), r"^e(\.[0-9]+)?$")
+    self.assertEqual(core.normalize_inputs_regexp("e", False), r"^e$")
 
   def test_infer_semantic(self):
     semantics = core.infer_semantic({
@@ -222,6 +223,20 @@ class SimpleMlTfTest(tf.test.TestCase):
     self.assertEqual(
         core.column_type_to_semantic(data_spec_pb2.ColumnType.CATEGORICAL_SET),
         core.Semantic.CATEGORICAL_SET)
+
+  def test_replace_port_in_address(self):
+    self.assertEqual(
+        core.replace_port_in_address("127.0.0.1:1234", 4567), "127.0.0.1:4567")
+    self.assertEqual(
+        core.replace_port_in_address("[::]:1234", 4567), "[::]:4567")
+    self.assertEqual(
+        core.replace_port_in_address("www.domain.com:1234", 4567),
+        "www.domain.com:4567")
+    self.assertEqual(
+        core.replace_port_in_address("127.0.0.1:1234", 4567), "127.0.0.1:4567")
+
+    with self.assertRaises(ValueError):
+      core.replace_port_in_address("127.0.0.1", 4567)
 
 
 if __name__ == "__main__":

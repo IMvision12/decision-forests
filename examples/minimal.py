@@ -12,89 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal usage example of TensorFlow Decision Forests.
+r"""Minimal usage example of TensorFlow Decision Forests.
 
-This example trains, displays and evaluates a Random Forest model on the adult
-dataset.
+This example trains, displays, evaluates and exports a Gradient Boosted Tree
+model.
 
-This example works with the pip package.
+Usage example:
 
-Usage example (in a shell):
-
-  pip3 install tensorflow_decision_forests
+  pip3 install tensorflow_decision_forests -U
   python3 minimal.py
 
-More examples are available in the documentation's colabs.
+Or
+
+  bazel run -c opt \
+  //tensorflow_decision_forests/examples:minimal \
+  -- --alsologtostderr
 """
+
+from absl import app
 
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 import tensorflow_decision_forests as tfdf
 
-# Check the current version of TensorFlow Decision Forests
-print("Found TF-DF v" + tfdf.__version__)
 
-# Download and assemble the Adult dataset.
-dataset_path = tf.keras.utils.get_file(
-    "adult.csv",
-    "https://raw.githubusercontent.com/google/yggdrasil-decision-forests/"
-    "main/yggdrasil_decision_forests/test_data/dataset/adult.csv")
+def main(argv):
+  if len(argv) > 1:
+    raise app.UsageError("Too many command-line arguments.")
 
-# Load a dataset into a Pandas Dataframe.
-dataset_df = pd.read_csv(dataset_path)  # "df" for Pandas's DataFrame.
+  # Download the Adult dataset.
+  dataset_path = tf.keras.utils.get_file(
+      "adult.csv",
+      "https://raw.githubusercontent.com/google/yggdrasil-decision-forests/"
+      "main/yggdrasil_decision_forests/test_data/dataset/adult.csv")
 
-print("First 3 examples:")
-print(dataset_df.head(3))
-# Note that the dataset contains a mix of numerical and categorical features.
-# TensorFlow Decision Forests will handle them automatically! (e.g. no see for
-# one-hot encoding or normalization; except for the label).
+  # Load a dataset into a Pandas Dataframe.
+  dataset_df = pd.read_csv(dataset_path)  # "df" for Pandas's DataFrame.
 
-# Split the dataset into a training and a testing dataset.
-test_indices = np.random.rand(len(dataset_df)) < 0.30
-test_ds_pd = dataset_df[test_indices]
-train_ds_pd = dataset_df[~test_indices]
-print(f"{len(train_ds_pd)} examples in training"
-      f", {len(test_ds_pd)} examples for testing.")
+  print("First the first three examples:")
+  print(dataset_df.head(3))
 
-# Converts a Pandas dataset into a tensorflow dataset
-train_ds = tfdf.keras.pd_dataframe_to_tf_dataset(train_ds_pd, label="income")
-test_ds = tfdf.keras.pd_dataframe_to_tf_dataset(test_ds_pd, label="income")
+  # Notice that the dataset contains a mix of numerical and categorical
+  # features. TensorFlow Decision Forests handles them automatically (e.g. no
+  # need for one-hot encoding or normalization; except for the label).
 
-# Important: If you build the tf.dataset manually:
-# - The batch size has no effect on the algorithm. 64 is a good default value.
-# - Don't shuffle the training dataset (unlike Neural Net, the algorithm does
-#   not benefit from shuffling). Bonus: The algorithm is deterministic (running
-#   it twice on the same dataset will give the same model).
-# - Don't use "repeats". The dataset should contain exactly one epoch.
+  # Split the dataset into a training and a testing dataset.
+  test_indices = np.random.rand(len(dataset_df)) < 0.30
+  test_ds_pd = dataset_df[test_indices]
+  train_ds_pd = dataset_df[~test_indices]
+  print(f"{len(train_ds_pd)} examples in training"
+        f", {len(test_ds_pd)} examples for testing.")
 
-# Trains the model.
-model = tfdf.keras.RandomForestModel(verbose=2)
-model.fit(x=train_ds)
+  # Converts datasets from Pandas dataframe to TensorFlow dataset format.
+  train_ds = tfdf.keras.pd_dataframe_to_tf_dataset(train_ds_pd, label="income")
+  test_ds = tfdf.keras.pd_dataframe_to_tf_dataset(test_ds_pd, label="income")
 
-# Note: If running in a Colab, ".fit()" will not print the training logs by
-# default. To do so, you need to encapsulate the "fit()" in a
-# "from wurlitzer import sys_pipescall" (see the colabs for some examples).
+  # Trains the model.
+  model = tfdf.keras.GradientBoostedTreesModel(verbose=2)
+  model.fit(train_ds)
 
-# Some information about the model.
-# Different learning algorithm (and different hyper-parameters) can output
-# different information.
-print(model.summary())
+  # Some information about the model.
+  print(model.summary())
 
-# Evaluate the model on the validation dataset.
-model.compile(metrics=["accuracy"])
-evaluation = model.evaluate(test_ds)
+  # Evaluates the model on the test dataset.
+  model.compile(metrics=["accuracy"])
+  evaluation = model.evaluate(test_ds)
+  print(f"BinaryCrossentropyloss: {evaluation[0]}")
+  print(f"Accuracy: {evaluation[1]}")
 
-# The first entry is the BinaryCrossentropy loss. The next entries are specified
-# by compile's metrics.
-print(f"BinaryCrossentropyloss: {evaluation[0]}")
-print(f"Accuracy: {evaluation[1]}")
+  # Exports the model to disk in the SavedModel format for later re-use. This
+  # model can be used with TensorFlow Serving and Yggdrasil Decision Forests
+  # (https://ydf.readthedocs.io/en/latest/serving_apis.html).
+  model.save("/tmp/my_saved_model")
 
-# Export the model to the SavedModel format for later re-use e.g. TensorFlow
-# Serving.
-model.save("/tmp/my_saved_model")
 
-# Note: This model is compatible with Yggdrasil Decision Forests.
-
-# Look at the feature importances.
-model.make_inspector().variable_importances()
+if __name__ == "__main__":
+  app.run(main)

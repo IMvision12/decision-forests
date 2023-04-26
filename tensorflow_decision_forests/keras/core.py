@@ -46,10 +46,11 @@ from __future__ import print_function
 
 import copy
 from datetime import datetime  # pylint: disable=g-importing-member
+import functools
 import inspect
 import os
 import tempfile
-from typing import Optional, List, Dict, Any, Text, Tuple, NamedTuple, Set
+from typing import Optional, List, Dict, Any, Tuple, NamedTuple, Set, Union
 
 import tensorflow as tf
 
@@ -61,6 +62,7 @@ from tensorflow_decision_forests.keras import core_inference
 from tensorflow_decision_forests.tensorflow import core as tf_core
 from tensorflow_decision_forests.tensorflow import tf1_compatibility
 from tensorflow_decision_forests.tensorflow import tf_logging
+from tensorflow_decision_forests.tensorflow import cc_logging
 from tensorflow_decision_forests.tensorflow.ops.inference import api as tf_op
 from tensorflow_decision_forests.tensorflow.ops.training import op as training_op
 from yggdrasil_decision_forests.dataset import data_spec_pb2
@@ -68,7 +70,12 @@ from yggdrasil_decision_forests.learner import abstract_learner_pb2
 from yggdrasil_decision_forests.model import abstract_model_pb2  # pylint: disable=unused-import
 from yggdrasil_decision_forests.utils.distribute.implementations.grpc import grpc_pb2  # pylint: disable=unused-import
 
-import keras.engine.data_adapter as data_adapter
+try:
+  # tf>1.12
+  import keras.src.engine.data_adapter as data_adapter
+except ImportError:
+  # tf<=1.12
+  import keras.engine.data_adapter as data_adapter
 get_data_handler = data_adapter.get_data_handler
 
 layers = tf.keras.layers
@@ -77,7 +84,9 @@ optimizers = tf.keras.optimizers
 losses = tf.keras.losses
 backend = tf.keras.backend
 
-no_automatic_dependency_tracking = tf1_compatibility.no_automatic_dependency_tracking
+no_automatic_dependency_tracking = (
+    tf1_compatibility.no_automatic_dependency_tracking
+)
 
 # Hyper-parameters of the model represented as a dictionary of <parameter names,
 # parameter values>.
@@ -99,6 +108,7 @@ ONLY_WARN_ON_DATASET_CONFIGURATION_ISSUES = False
 # Imports from the inference only code.
 # pylint: disable=protected-access
 Task = core_inference.Task
+MultiTaskItem = core_inference.MultiTaskItem
 TaskType = core_inference.TaskType
 FeatureColumn = core_inference.FeatureColumn
 FeatureSemantic = core_inference.FeatureSemantic
@@ -109,11 +119,9 @@ yggdrasil_model_to_keras_model = core_inference.yggdrasil_model_to_keras_model
 YggdrasilTrainingConfig = core_inference.YggdrasilTrainingConfig
 YggdrasilDeploymentConfig = core_inference.YggdrasilDeploymentConfig
 yggdrasil_model_to_keras_model = core_inference.yggdrasil_model_to_keras_model
-_LABEL = core_inference._LABEL
-_RANK_GROUP = core_inference._RANK_GROUP
-_UPLIFT_TREATMENT = core_inference._UPLIFT_TREATMENT
-_WEIGHTS = core_inference._WEIGHTS
+WEIGHTS = core_inference.WEIGHTS
 _FORBIDDEN_FEATURE_CHARACTERS = core_inference._FORBIDDEN_FEATURE_CHARACTERS
+NodeFormat = core_inference.NodeFormat
 # pylint: enable=protected-access
 
 
@@ -164,14 +172,29 @@ class FeatureUsage(object):
       of unique categorical values stored as string. If more categorical values
       are present, the least frequent values are grouped into a
       Out-of-vocabulary item. Reducing the value can improve or hurt the model.
+    min_vocab_frequency: For CATEGORICAL and CATEGORICAL_SET features only.
+      Minimum number of occurence of a categorical value. Values present less
+      than "min_vocab_frequency" times in the training dataset are treated as
+      "Out-of-vocabulary".
+    override_global_imputation_value: For CATEGORICAL and CATEGORICAL_SET
+      features only. If set, replaces the global imputation value used to handle
+      missing values. That is, at inference time, missing values will be treated
+      as "override_global_imputation_value". "override_global_imputation_value"
+      can only be used on categorical features and on columns not containing
+      missing values in the training dataset. If the algorithm used to handle
+      missing values is not "GLOBAL_IMPUTATION" (default algorithm), this value
+      is ignored.
   """
 
-  def __init__(self,
-               name: Text,
-               semantic: Optional[FeatureSemantic] = None,
-               num_discretized_numerical_bins: Optional[int] = None,
-               max_vocab_count: Optional[int] = None):
-
+  def __init__(
+      self,
+      name: str,
+      semantic: Optional[FeatureSemantic] = None,
+      num_discretized_numerical_bins: Optional[int] = None,
+      max_vocab_count: Optional[int] = None,
+      min_vocab_frequency: Optional[int] = None,
+      override_global_imputation_value: Optional[str] = None,
+  ):
     self._name = name
     self._semantic = semantic
     self._guide = data_spec_pb2.ColumnGuide()
@@ -179,15 +202,29 @@ class FeatureUsage(object):
     # Check matching between hyper-parameters and semantic.
     if semantic != FeatureSemantic.DISCRETIZED_NUMERICAL:
       if num_discretized_numerical_bins is not None:
-        raise ValueError("\"discretized\" only works for DISCRETIZED_NUMERICAL"
-                         " semantic.")
+        raise ValueError(
+            '"discretized" only works for DISCRETIZED_NUMERICAL semantic.'
+        )
 
     if semantic not in [
-        FeatureSemantic.CATEGORICAL, FeatureSemantic.CATEGORICAL_SET
+        FeatureSemantic.CATEGORICAL,
+        FeatureSemantic.CATEGORICAL_SET,
     ]:
       if max_vocab_count is not None:
-        raise ValueError("\"max_vocab_count\" only works for CATEGORICAL "
-                         "and CATEGORICAL_SET semantic.")
+        raise ValueError(
+            '"max_vocab_count" only works for CATEGORICAL '
+            "and CATEGORICAL_SET semantic."
+        )
+      if min_vocab_frequency is not None:
+        raise ValueError(
+            '"min_vocab_frequency" only works for CATEGORICAL '
+            "and CATEGORICAL_SET semantic."
+        )
+      if override_global_imputation_value is not None:
+        raise ValueError(
+            '"override_global_imputation_value" only works for CATEGORICAL '
+            "and CATEGORICAL_SET semantic."
+        )
 
     if semantic is None:
       # The semantic is automatically determined at training time.
@@ -198,9 +235,12 @@ class FeatureUsage(object):
     elif semantic == FeatureSemantic.DISCRETIZED_NUMERICAL:
       self._guide.type = data_spec_pb2.DISCRETIZED_NUMERICAL
       if num_discretized_numerical_bins is not None:
-        self._guide.discretized_numerical.maximum_num_bins = num_discretized_numerical_bins
+        self._guide.discretized_numerical.maximum_num_bins = (
+            num_discretized_numerical_bins
+        )
     elif semantic in [
-        FeatureSemantic.CATEGORICAL, FeatureSemantic.CATEGORICAL_SET
+        FeatureSemantic.CATEGORICAL,
+        FeatureSemantic.CATEGORICAL_SET,
     ]:
       if semantic == FeatureSemantic.CATEGORICAL:
         self._guide.type = data_spec_pb2.CATEGORICAL
@@ -209,6 +249,14 @@ class FeatureUsage(object):
 
       if max_vocab_count:
         self._guide.categorial.max_vocab_count = max_vocab_count
+
+      if override_global_imputation_value:
+        self._guide.categorial.override_most_frequent_item.str_value = (
+            override_global_imputation_value
+        )
+
+      if min_vocab_frequency:
+        self._guide.categorial.min_vocab_frequency = min_vocab_frequency
 
     else:
       raise ValueError("Non supported semantic {}".format(semantic))
@@ -222,7 +270,7 @@ class FeatureUsage(object):
     return self._semantic
 
   @property
-  def name(self) -> Text:
+  def name(self) -> str:
     return self._name
 
 
@@ -268,7 +316,7 @@ class CoreModel(InferenceCoreModel):
   ```
 
   The training logs (e.g. feature statistics, validation loss, remaining
-  training time) are exported to LOG(INFO). If you use a colab, make sure to
+  training time) are exported to YDF_LOG(INFO). If you use a colab, make sure to
   display these logs:
 
     from colabtools import googlelog
@@ -311,17 +359,17 @@ class CoreModel(InferenceCoreModel):
       it is recommended for the preprocessing to return a dictionary of tensors.
     exclude_non_specified_features: If true, only use the features specified in
       "features".
-    preprocessing: Functional keras model or `@tf.function` to apply on the input
-      feature before the model to train. This preprocessing model can consume
-      and return tensors, list of tensors or dictionary of tensors. If
+    preprocessing: Functional keras model or `@tf.function` to apply on the
+      input feature before the model to train. This preprocessing model can
+      consume and return tensors, list of tensors or dictionary of tensors. If
       specified, the model only "sees" the output of the preprocessing (and not
       the raw input). Can be used to prepare the features or to stack multiple
       models on top of each other. Unlike preprocessing done in the tf.dataset,
       the operation in "preprocessing" are serialized with the model.
     postprocessing: Like "preprocessing" but applied on the model output.
-    ranking_group: Only for `task=Task.RANKING`. Name of a `tf.string` feature that
-      identifies queries in a query/document ranking task. The ranking group is
-      not added automatically for the set of features if
+    ranking_group: Only for `task=Task.RANKING`. Name of a `tf.string` feature
+      that identifies queries in a query/document ranking task. The ranking
+      group is not added automatically for the set of features if
       `exclude_non_specified_features=false`.
     uplift_treatment: Only for `task=Task.CATEGORICAL_UPLIFT` and `task=Task`.
       NUMERICAL_UPLIFT. Name of an integer feature that identifies the treatment
@@ -377,6 +425,10 @@ class CoreModel(InferenceCoreModel):
     num_discretize_numerical_bins: Number of bins used when disretizing
       numerical features. The value `num_discretized_numerical_bins` defined in
       a `FeatureUsage` (if any) takes precedence.
+    multitask: If set, train a multi-task model, that is a model with multiple
+      outputs trained to predict different labels. If set, the tf.dataset label
+      (i.e. the second selement of the dataset) should be a dictionary of
+      label_key:label_values. Only one of `multitask` and `task` can be set.
   """
 
   def __init__(
@@ -401,6 +453,7 @@ class CoreModel(InferenceCoreModel):
       tuner: Optional[tuner_lib.Tuner] = None,
       discretize_numerical_features: bool = False,
       num_discretized_numerical_bins: int = 255,
+      multitask: Optional[List[MultiTaskItem]] = None,
   ) -> None:
     super(CoreModel, self).__init__(
         name=name,
@@ -412,6 +465,9 @@ class CoreModel(InferenceCoreModel):
         postprocessing=postprocessing,
         uplift_treatment=uplift_treatment,
         temp_directory=temp_directory,
+        multitask=multitask,
+        learner=learner,
+        tuner=tuner,
     )
 
     self._learner = learner  # Only used for user inspection
@@ -436,7 +492,8 @@ class CoreModel(InferenceCoreModel):
       if self._num_threads is None:
         if self._verbose >= 1:
           tf_logging.warning(
-              "Cannot determine the number of CPUs. Set num_threads=6")
+              "Cannot determine the number of CPUs. Set num_threads=6"
+          )
         self._num_threads = 6
       else:
         if self._num_threads >= 32:
@@ -444,39 +501,36 @@ class CoreModel(InferenceCoreModel):
             tf_logging.warning(
                 "The `num_threads` constructor argument is not set and the "
                 "number of CPU is os.cpu_count()=%d > 32. Setting num_threads "
-                "to 32. Set num_threads manually to use more than 32 cpus." %
-                self._num_threads)
+                "to 32. Set num_threads manually to use more than 32 cpus."
+                % self._num_threads
+            )
           self._num_threads = 32
         else:
           if self._verbose >= 2:
             tf_logging.info("Use %d thread(s) for training", self._num_threads)
 
-    # Configure the training config.
-    if tuner is not None:
-      tuner.set_base_learner(learner)
-      self._advanced_arguments.yggdrasil_training_config.MergeFrom(
-          tuner.train_config())
-    else:
-      self._advanced_arguments.yggdrasil_training_config.learner = learner
-
     if not self._features and exclude_non_specified_features:
       raise ValueError(
           "The model does not have any input features: "
           "exclude_non_specified_features is True and not features are "
-          "provided as input.")
+          "provided as input."
+      )
 
     if self._temp_directory is None:
       self._temp_directory_handle = tempfile.TemporaryDirectory()
       self._temp_directory = self._temp_directory_handle.name
       if self._verbose >= 1:
-        tf_logging.info("Use %s as temporary training directory",
-                        self._temp_directory)
+        tf_logging.info(
+            "Use %s as temporary training directory", self._temp_directory
+        )
 
     # If the model is trained with weights.
     self._weighted_training = False
 
     # True if the user provides a validation dataset to `fit`.
     self._has_validation_dataset = False
+
+    self._check_parameters()
 
   @property
   def learner_params(self) -> Optional[HyperParameters]:
@@ -533,6 +587,23 @@ class CoreModel(InferenceCoreModel):
     """
     super(CoreModel, self).load_weights(*args, **kwargs)
 
+  def train_on_batch(self, *args, **kwargs):
+    """No supported for Tensorflow Decision Forests models.
+
+    Decision forests are not trained in batches the same way neural networks
+    are. To avoid confusion, train_on_batch is disabled.
+
+    Args:
+      *args: Ignored
+      **kwargs: Ignored.
+    """
+    raise NotImplementedError(
+        "Decision Forests are not trained in batches by "
+        "definition. If you plan to update a model with "
+        "new data, create a new model on the entire "
+        "dataset."
+    )
+
   # This function should not be serialized in the SavedModel.
   @no_automatic_dependency_tracking
   @tf.function(reduce_retracing=True)
@@ -556,9 +627,11 @@ class CoreModel(InferenceCoreModel):
     """Collect examples e.g. training or validation."""
 
     if isinstance(data, dict):
-      raise ValueError("No label received for training. If you used "
-                       "`pd_dataframe_to_tf_dataset`, make sure to "
-                       f"specify the `label` argument. data={data}")
+      raise ValueError(
+          "No label received for training. If you used "
+          "`pd_dataframe_to_tf_dataset`, make sure to "
+          f"specify the `label` argument. data={data}"
+      )
 
     if len(data) == 2:
       train_x, train_y = data
@@ -571,13 +644,17 @@ class CoreModel(InferenceCoreModel):
     if self._verbose >= 2:
       tf_logging.info(
           "%s tensor examples:\nFeatures: %s\nLabel: %s\nWeights: %s",
-          "Training" if is_training_example else "Validation", train_x, train_y,
-          train_weights)
+          "Training" if is_training_example else "Validation",
+          train_x,
+          train_y,
+          train_weights,
+      )
 
     if isinstance(train_x, dict):
       _check_feature_names(
           train_x.keys(),
-          self._advanced_arguments.fail_on_non_keras_compatible_feature_name)
+          self._advanced_arguments.fail_on_non_keras_compatible_feature_name,
+      )
 
     if self._preprocessing is not None:
       train_x = self._preprocessing(train_x)
@@ -585,9 +662,10 @@ class CoreModel(InferenceCoreModel):
         tf_logging.info("Tensor example after pre-processing:\n%s", train_x)
       if isinstance(train_x, list) and self._features:
         tf_logging.warning(
-            "Using \"features\" with a pre-processing stage returning a list "
+            'Using "features" with a pre-processing stage returning a list '
             "is not recommended. Use a pre-processing stage that returns a "
-            "dictionary instead.")
+            "dictionary instead."
+        )
 
     if isinstance(train_x, dict):
       # Native format
@@ -600,25 +678,9 @@ class CoreModel(InferenceCoreModel):
       train_x = {str(idx): value for idx, value in enumerate(train_x)}
     else:
       raise ValueError(
-          f"The training input tensor is expected to be a tensor, list of "
-          f"tensors or a dictionary of tensors. Got {train_x} instead")
-
-    # Check the labels
-    if not isinstance(train_y, tf.Tensor):
-      raise ValueError(
-          f"The training label tensor is expected to be a tensor. Got {train_y}"
-          " instead.")
-
-    if len(train_y.shape) != 1:
-      if self._verbose >= 2:
-        tf_logging.info(
-            "Squeeze label' shape from [batch_size, 1] to [batch_size]")
-      train_y = tf.squeeze(train_y, axis=1)
-
-    if len(train_y.shape) != 1:
-      raise ValueError(
-          "Labels can either be passed in as [batch_size, 1] or [batch_size]. "
-          "Invalid shape %s." % train_y.shape)
+          "The training input tensor is expected to be a tensor, list of "
+          f"tensors or a dictionary of tensors. Got {train_x} instead"
+      )
 
     # Check the training
     self._weighted_training = train_weights is not None
@@ -626,156 +688,254 @@ class CoreModel(InferenceCoreModel):
       if not isinstance(train_weights, tf.Tensor):
         raise ValueError(
             "The training weights tensor is expected to be a tensor. "
-            f"Got {train_weights} instead.")
+            f"Got {train_weights} instead."
+        )
 
       if len(train_weights.shape) != 1:
         if self._verbose >= 2:
           tf_logging.info(
-              "Squeeze weight' shape from [batch_size, 1] to [batch_size]")
+              "Squeeze weight' shape from [batch_size, 1] to [batch_size]"
+          )
         train_weights = tf.squeeze(train_weights, axis=1)
 
       if len(train_weights.shape) != 1:
         raise ValueError(
-            "Weights can either be passed in as [batch_size, 1] or [batch_size]. "
-            "Invalid shape %s." % train_weights.shape)
+            "Weights can either be passed in as [batch_size, 1] or"
+            " [batch_size]. Invalid shape %s."
+            % train_weights.shape
+        )
 
     # List the input features and their semantics.
     semantics = tf_core.infer_semantic(
-        train_x, {feature.name: feature.semantic for feature in self._features},
-        self._exclude_non_specified)
+        train_x,
+        {feature.name: feature.semantic for feature in self._features},
+        self._exclude_non_specified,
+    )
 
     # The ranking group and treatment are not part of the features unless
     # specified explicitly.
-    if (self._ranking_group is not None and
-        self._ranking_group not in self._features and
-        self._ranking_group in semantics):
-      del semantics[self._ranking_group]
+    ranking_group = self.ranking_group()
+    if (
+        ranking_group is not None
+        and ranking_group not in self._features
+        and ranking_group in semantics
+    ):
+      del semantics[ranking_group]
 
-    if (self._uplift_treatment is not None and
-        self._uplift_treatment not in self._features and
-        self._uplift_treatment in semantics):
-      del semantics[self._uplift_treatment]
+    uplift_treatment = self.uplift_treatment()
+    if (
+        uplift_treatment is not None
+        and uplift_treatment not in self._features
+        and uplift_treatment in semantics
+    ):
+      del semantics[uplift_treatment]
+
+    # Note: At this point, "semantics" contains the non-normalized input featues
+    # of the models.
 
     if is_training_example:
       if self._semantics is not None:
         raise ValueError("The model is already trained")
+
+      # Save the semantic for later re-use.
       self._semantics = semantics
+
     else:
       self._has_validation_dataset = True
       if self._semantics is None:
         raise ValueError(
-            "The validation should be collected after the training")
+            "The validation should be collected after the training"
+        )
 
       if semantics != self._semantics:
         raise ValueError(
             "The validation dataset does not have the same "
             "semantic as the training dataset.\nTraining:\n{}\nValidation:\n{}"
-            .format(self._semantics, semantics))
+            .format(self._semantics, semantics)
+        )
 
     semantic_inputs = tf_core.combine_tensors_and_semantics(train_x, semantics)
 
     normalized_semantic_inputs = tf_core.normalize_inputs(
         semantic_inputs,
-        categorical_integer_offset_correction=not self._advanced_arguments
-        .disable_categorical_integer_offset_correction)
+        categorical_integer_offset_correction=not self._advanced_arguments.disable_categorical_integer_offset_correction,
+    )
 
     if self._verbose >= 2:
-      tf_logging.info("Normalized tensor features:\n %s",
-                      normalized_semantic_inputs)
+      tf_logging.info(
+          "Normalized tensor features:\n %s", normalized_semantic_inputs
+      )
 
     if is_training_example:
-      self._normalized_input_keys = sorted(
-          list(normalized_semantic_inputs.keys()))
+      self._normalized_input_feature_keys = sorted(
+          list(normalized_semantic_inputs.keys())
+      )
 
     # Add the weights
     if self._weighted_training:
-      normalized_semantic_inputs[_WEIGHTS] = tf_core.SemanticTensor(
+      normalized_semantic_inputs[WEIGHTS] = tf_core.SemanticTensor(
           tensor=tf.cast(train_weights, tf_core.NormalizedNumericalType),
-          semantic=tf_core.Semantic.NUMERICAL)
+          semantic=tf_core.Semantic.NUMERICAL,
+      )
 
-    # Add the semantic of the label.
-    if self._task == Task.CLASSIFICATION:
-      normalized_semantic_inputs[_LABEL] = tf_core.SemanticTensor(
-          tensor=tf.cast(train_y, tf_core.NormalizedCategoricalIntType) +
-          tf_core.CATEGORICAL_INTEGER_OFFSET,
-          semantic=tf_core.Semantic.CATEGORICAL)
+    # Add label(s)
+    last_train_y = None
+    for multitask_item in self._multitask:
+      unit_train_y = self._label_tensor(train_y, multitask_item.label)
+      last_train_y = unit_train_y
 
-    elif self._task == Task.REGRESSION:
-      normalized_semantic_inputs[_LABEL] = tf_core.SemanticTensor(
-          tensor=tf.cast(train_y, tf_core.NormalizedNumericalType),
-          semantic=tf_core.Semantic.NUMERICAL)
+      if multitask_item.label in normalized_semantic_inputs:
+        raise ValueError(
+            f'The label key "{multitask_item.label}" is already present as a '
+            "label or as a feature."
+        )
 
-    elif self._task == Task.RANKING:
-      normalized_semantic_inputs[_LABEL] = tf_core.SemanticTensor(
-          tensor=tf.cast(train_y, tf_core.NormalizedNumericalType),
-          semantic=tf_core.Semantic.NUMERICAL)
+      if multitask_item.task == Task.CLASSIFICATION:
+        normalized_semantic_inputs[multitask_item.label] = (
+            tf_core.SemanticTensor(
+                tensor=tf.cast(
+                    unit_train_y, tf_core.NormalizedCategoricalIntType
+                )
+                + tf_core.CATEGORICAL_INTEGER_OFFSET,
+                semantic=tf_core.Semantic.CATEGORICAL,
+            )
+        )
 
-      assert self._ranking_group is not None
-      if self._ranking_group not in train_x:
-        raise Exception(
-            "The ranking key feature \"{}\" is not available as an input "
-            "feature.".format(self._ranking_group))
-      normalized_semantic_inputs[_RANK_GROUP] = tf_core.SemanticTensor(
-          tensor=tf.cast(train_x[self._ranking_group],
-                         tf_core.NormalizedHashType),
-          semantic=tf_core.Semantic.HASH)
+      elif multitask_item.task == Task.REGRESSION:
+        normalized_semantic_inputs[multitask_item.label] = (
+            tf_core.SemanticTensor(
+                tensor=tf.cast(unit_train_y, tf_core.NormalizedNumericalType),
+                semantic=tf_core.Semantic.NUMERICAL,
+            )
+        )
 
-    elif self._task == Task.CATEGORICAL_UPLIFT:
-      normalized_semantic_inputs[_LABEL] = tf_core.SemanticTensor(
-          tensor=tf.cast(train_y, tf_core.NormalizedCategoricalIntType) +
-          tf_core.CATEGORICAL_INTEGER_OFFSET,
-          semantic=tf_core.Semantic.CATEGORICAL)
+      elif multitask_item.task == Task.RANKING:
+        normalized_semantic_inputs[multitask_item.label] = (
+            tf_core.SemanticTensor(
+                tensor=tf.cast(unit_train_y, tf_core.NormalizedNumericalType),
+                semantic=tf_core.Semantic.NUMERICAL,
+            )
+        )
 
-      assert self._uplift_treatment is not None
-      if self._uplift_treatment not in train_x:
-        raise Exception(
-            "The uplift treatment key feature \"{}\" is not available as an input "
-            "feature.".format(self._uplift_treatment))
-      normalized_semantic_inputs[_UPLIFT_TREATMENT] = tf_core.SemanticTensor(
-          tensor=tf.cast(train_x[self._uplift_treatment],
-                         tf_core.NormalizedCategoricalIntType) +
-          tf_core.CATEGORICAL_INTEGER_OFFSET,
-          semantic=tf_core.Semantic.CATEGORICAL)
+        assert self.ranking_group() is not None
+        if self.ranking_group() not in train_x:
+          raise Exception(
+              'The ranking key feature "{}" is not available as an input '
+              "feature.".format(self.ranking_group())
+          )
 
-    elif self._task == Task.NUMERICAL_UPLIFT:
-      normalized_semantic_inputs[_LABEL] = tf_core.SemanticTensor(
-          tensor=tf.cast(train_y, tf_core.NormalizedNumericalType),
-          semantic=tf_core.Semantic.NUMERICAL)
+        if self.ranking_group() in normalized_semantic_inputs:
+          raise ValueError(
+              f'The ranking group key "{self.ranking_group()}" is already'
+              " present as a label or as a feature."
+          )
 
-      assert self._uplift_treatment is not None
-      if self._uplift_treatment not in train_x:
-        raise Exception(
-            "The uplift treatment key feature \"{}\" is not available as an input "
-            "feature.".format(self._uplift_treatment))
-      normalized_semantic_inputs[_UPLIFT_TREATMENT] = tf_core.SemanticTensor(
-          tensor=tf.cast(train_x[self._uplift_treatment],
-                         tf_core.NormalizedCategoricalIntType) +
-          tf_core.CATEGORICAL_INTEGER_OFFSET,
-          semantic=tf_core.Semantic.CATEGORICAL)
+        normalized_semantic_inputs[self.ranking_group()] = (
+            tf_core.SemanticTensor(
+                tensor=tf.cast(
+                    train_x[self.ranking_group()], tf_core.NormalizedHashType
+                ),
+                semantic=tf_core.Semantic.HASH,
+            )
+        )
 
-    else:
-      raise Exception("Non supported task {}".format(self._task))
+      elif multitask_item.task == Task.CATEGORICAL_UPLIFT:
+        normalized_semantic_inputs[multitask_item.label] = (
+            tf_core.SemanticTensor(
+                tensor=tf.cast(
+                    unit_train_y, tf_core.NormalizedCategoricalIntType
+                )
+                + tf_core.CATEGORICAL_INTEGER_OFFSET,
+                semantic=tf_core.Semantic.CATEGORICAL,
+            )
+        )
+
+        assert self.uplift_treatment() is not None
+        if self.uplift_treatment() not in train_x:
+          raise Exception(
+              'The uplift treatment key feature "{}" is not available as an '
+              "input feature.".format(self.uplift_treatment())
+          )
+
+        if self.uplift_treatment() in normalized_semantic_inputs:
+          raise ValueError(
+              f'The uplift treatment group key "{self.uplift_treatment()}" is '
+              "already present as a label or as a feature."
+          )
+
+        normalized_semantic_inputs[self.uplift_treatment()] = (
+            tf_core.SemanticTensor(
+                tensor=tf.cast(
+                    train_x[self.uplift_treatment()],
+                    tf_core.NormalizedCategoricalIntType,
+                )
+                + tf_core.CATEGORICAL_INTEGER_OFFSET,
+                semantic=tf_core.Semantic.CATEGORICAL,
+            )
+        )
+
+      elif multitask_item.task == Task.NUMERICAL_UPLIFT:
+        normalized_semantic_inputs[multitask_item.label] = (
+            tf_core.SemanticTensor(
+                tensor=tf.cast(unit_train_y, tf_core.NormalizedNumericalType),
+                semantic=tf_core.Semantic.NUMERICAL,
+            )
+        )
+
+        assert self.uplift_treatment() is not None
+        if self.uplift_treatment() not in train_x:
+          raise Exception(
+              'The uplift treatment key feature "{}" is not available as an'
+              " input feature.".format(self.uplift_treatment())
+          )
+
+        if self.uplift_treatment() in normalized_semantic_inputs:
+          raise ValueError(
+              f'The uplift treatment group key "{self.uplift_treatment()}" is '
+              "already present as a label or as a feature."
+          )
+
+        normalized_semantic_inputs[self.uplift_treatment()] = (
+            tf_core.SemanticTensor(
+                tensor=tf.cast(
+                    train_x[self.uplift_treatment()],
+                    tf_core.NormalizedCategoricalIntType,
+                )
+                + tf_core.CATEGORICAL_INTEGER_OFFSET,
+                semantic=tf_core.Semantic.CATEGORICAL,
+            )
+        )
+
+      else:
+        raise Exception(f"Non supported task {multitask_item.task}")
+
+    if is_training_example:
+      self._normalized_column_keys = sorted(
+          list(normalized_semantic_inputs.keys())
+      )
 
     if not self._is_trained:
       # Collects the training examples.
 
       distribution_config = tf_core.get_distribution_configuration(
-          self.distribute_strategy)
-      if distribution_config is None:
+          self.distribute_strategy
+      )
+      if distribution_config is None or not self.support_distributed_training():
         # No distribution strategy. Collecting examples in memory.
         tf_core.collect_training_examples(
             normalized_semantic_inputs,
             self._training_model_id,
-            collect_training_data=is_training_example)
+            collect_training_data=is_training_example,
+        )
 
       else:
-
         if not is_training_example:
           tf_logging.warning(
               "The validation dataset given to `fit` is not used to help "
               "training (e.g. early stopping) in the case of distributed "
               "training. If you want to use a validation dataset use "
-              "non-distributed training or use `fit_from_file` instead.")
+              "non-distributed training or use `fit_from_file` instead."
+          )
 
         # Each worker collects a part of the dataset.
         if not self.capabilities().support_partial_cache_dataset_format:
@@ -788,32 +948,93 @@ class CoreModel(InferenceCoreModel):
               "around the model construction). If the dataset is large, use a "
               "distributed version of the model. For Example, use "
               "DistributedGradientBoostedTreesModel instead of "
-              "GradientBoostedTreesModel.")
+              "GradientBoostedTreesModel."
+          )
 
         tf_core.collect_distributed_training_examples(
             inputs=normalized_semantic_inputs,
             model_id=self._training_model_id,
-            dataset_path=self._distributed_partial_dataset_cache_path())
+            dataset_path=self._distributed_partial_dataset_cache_path(),
+        )
 
     # Number of scanned examples.
-    return tf.shape(train_y)[0]
+    return tf.shape(last_train_y)[0]
+
+  def _label_tensor(
+      self,
+      label: Union[tf.Tensor, Dict[str, tf.Tensor]],
+      label_key: Optional[str],
+  ) -> tf.Tensor:
+    """Extracts and normalize the label tensor from the tf dataset label."""
+
+    def normalize_unit_label(unit_label: tf.Tensor) -> tf.Tensor:
+      if not isinstance(unit_label, tf.Tensor):
+        raise ValueError(
+            "The training label tensor is expected to be a tensor. Got"
+            f" {unit_label} instead."
+        )
+
+      if len(unit_label.shape) != 1:
+        if self._verbose >= 2:
+          tf_logging.info(
+              "Squeeze label' shape from [batch_size, 1] to [batch_size]"
+          )
+        unit_label = tf.squeeze(unit_label, axis=1)
+
+      if len(unit_label.shape) != 1:
+        raise ValueError(
+            "Labels can either be passed in as [batch_size, 1] or [batch_size]."
+            " Invalid shape %s."
+            % unit_label.shape
+        )
+
+      return unit_label
+
+    if self._is_multitask:
+      if not isinstance(label, dict):
+        raise ValueError(
+            "This is a multi-task model, therefore the label should be a "
+            f"dictionary of tensors with keys {self._multitask.key}. Instead, "
+            f"got {label}"
+        )
+      assert label_key is not None
+      if label_key not in label:
+        raise ValueError(
+            f'Label "{label_key}" not found in the label dictionary'
+            f" {label.keys()}"
+        )
+      return normalize_unit_label(label[label_key])
+    else:
+      if not isinstance(label, tf.Tensor):
+        raise ValueError(
+            f"The label is expected to be a tensor. Instead, got {label}"
+        )
+      return normalize_unit_label(label)
 
   def _distributed_partial_dataset_cache_path(self):
     """Directory accessible from all workers containing the partial cache."""
 
     return os.path.join(self._temp_directory, "partial_dataset_cache")
 
-  def fit(self,
-          x=None,
-          y=None,
-          callbacks=None,
-          verbose: Optional[Any] = None,
-          validation_steps: Optional[int] = None,
-          validation_data: Optional[Any] = None,
-          sample_weight: Optional[Any] = None,
-          steps_per_epoch: Optional[Any] = None,
-          class_weight: Optional[Any] = None,
-          **kwargs) -> tf.keras.callbacks.History:
+  def support_distributed_training(self):
+    return (
+        self._tuner is None
+        or self.capabilities().support_partial_cache_dataset_format
+    )
+
+  def fit(
+      self,
+      x=None,
+      y=None,
+      callbacks=None,
+      verbose: Optional[Any] = None,
+      validation_steps: Optional[int] = None,
+      validation_data: Optional[Any] = None,
+      sample_weight: Optional[Any] = None,
+      steps_per_epoch: Optional[Any] = None,
+      class_weight: Optional[Any] = None,
+      **kwargs,
+  ) -> tf.keras.callbacks.History:
     """Trains the model.
 
     Local training
@@ -956,8 +1177,8 @@ class CoreModel(InferenceCoreModel):
       validation_data: Validation dataset. If specified, the learner might use
         this dataset to help training e.g. early stopping.
       sample_weight: Training weights. Note: training weights can also be
-        provided as the third output in a `tf.data.Dataset` e.g. (features, label,
-        weights).
+        provided as the third output in a `tf.data.Dataset` e.g. (features,
+        label, weights).
       steps_per_epoch: [Parameter will be removed] Number of training batch to
         load before training the model. Currently, only supported for
         distributed training.
@@ -987,17 +1208,19 @@ class CoreModel(InferenceCoreModel):
           "`fit` cannot consume Pandas' dataframes directly. Instead, use the "
           "`pd_dataframe_to_tf_dataset` utility function. For example: "
           "`model.fit(tfdf.keras.pd_dataframe_to_tf_dataset(train_dataframe, "
-          "label=\"label_column\"))")
+          'label="label_column"))'
+      )
 
     # If the dataset was created with "pd_dataframe_to_tf_dataset", ensure that
     # the task is correctly set.
     if hasattr(x, "_tfdf_task"):
       dataset_task = getattr(x, "_tfdf_task")
-      if dataset_task != self._task:
+      if not self._is_multitask and dataset_task != self.task:
         raise ValueError(
-            f"The model's `task` attribute ({Task.Name(self._task)}) does "
+            f"The model's `task` attribute ({Task.Name(self.task)}) does "
             "not match the `task` attribute passed to "
-            f"`pd_dataframe_to_tf_dataset` ({Task.Name(dataset_task)}).")
+            f"`pd_dataframe_to_tf_dataset` ({Task.Name(dataset_task)})."
+        )
 
     # Check the dataset.
     if self._check_dataset and isinstance(x, tf.data.Dataset):
@@ -1012,20 +1235,26 @@ class CoreModel(InferenceCoreModel):
         # TODO: Remove epoch argument.
         if extra_values != 1:
           raise ValueError(
-              "all decision forests algorithms train with only 1 " +
-              "epoch, epochs={} given".format(kwargs["epochs"]))
+              "all decision forests algorithms train with only 1 "
+              + "epoch, epochs={} given".format(kwargs["epochs"])
+          )
       else:
         tf_logging.warning(
-            "Model constructor argument %s=%s not supported. "
-            "See https://www.tensorflow.org/decision_forests/migration for an "
-            "explanation about the specificities of TF-DF.", extra_key,
-            extra_values)
+            (
+                "Model constructor argument %s=%s not supported. See"
+                " https://www.tensorflow.org/decision_forests/migration for an"
+                " explanation about the specificities of TF-DF."
+            ),
+            extra_key,
+            extra_values,
+        )
 
     if steps_per_epoch is not None:
       tf_logging.warning(
           "The steps_per_epoch argument is deprecated. Instead, feed a "
           "finite dataset (i.e. a dataset without repeat statement) and remove "
-          "the steps_per_epoch argument.")
+          "the steps_per_epoch argument."
+      )
 
     # Reset the training status.
     self._is_trained.assign(False)
@@ -1034,12 +1263,13 @@ class CoreModel(InferenceCoreModel):
         x=x,
         y=y,
         callbacks=callbacks,
-        verbose=verbose,
+        verbose=self._verbose,
         validation_steps=validation_steps,
         validation_data=validation_data,
         sample_weight=sample_weight,
         steps_per_epoch=steps_per_epoch,
-        class_weight=class_weight)
+        class_weight=class_weight,
+    )
 
   @no_automatic_dependency_tracking
   @tf.function(reduce_retracing=True)
@@ -1082,8 +1312,16 @@ class CoreModel(InferenceCoreModel):
     return num_examples
 
   def _fit_implementation(
-      self, x, y, verbose, callbacks, sample_weight, validation_data,
-      validation_steps, steps_per_epoch, class_weight
+      self,
+      x,
+      y,
+      verbose,
+      callbacks,
+      sample_weight,
+      validation_data,
+      validation_steps,
+      steps_per_epoch,
+      class_weight,
   ) -> tf.keras.callbacks.History:  # pylint: disable=g-doc-args,g-doc-return-or-yield
     """Train the model.
 
@@ -1106,7 +1344,8 @@ class CoreModel(InferenceCoreModel):
     # Create the callback manager
     if not isinstance(callbacks, tf.keras.callbacks.CallbackList):
       callbacks = tf.keras.callbacks.CallbackList(
-          callbacks, model=self, add_history=False)
+          callbacks, model=self, add_history=False
+      )
 
     # Manages the history manually.
     # Note: The both the History and CallbackList object will override the
@@ -1121,7 +1360,8 @@ class CoreModel(InferenceCoreModel):
 
     # Check if the training is local or distributed.
     distribution_config = tf_core.get_distribution_configuration(
-        self.distribute_strategy)
+        self.distribute_strategy
+    )
 
     # Instantiate the validation data handler.
     # We create the handler before the training such that if it is
@@ -1129,10 +1369,11 @@ class CoreModel(InferenceCoreModel):
     # training).
     validation_data_handler = None
     if validation_data:
-      val_x, val_y, val_sample_weight = (
-          tf.keras.utils.unpack_x_y_sample_weight(validation_data))
+      val_x, val_y, val_sample_weight = tf.keras.utils.unpack_x_y_sample_weight(
+          validation_data
+      )
 
-      if distribution_config is None:
+      if distribution_config is None or not self.support_distributed_training():
         # TODO: The validation_data is currently not used for distributed
         # training (except for the model validation evaluation). Creating
         # and not using the validation_data_handler for distributed training
@@ -1145,14 +1386,15 @@ class CoreModel(InferenceCoreModel):
             sample_weight=val_sample_weight,
             model=self,
             steps_per_epoch=validation_steps,
-            class_weight=class_weight)
+            class_weight=class_weight,
+        )
 
     time_begin_train_dataset_reading = datetime.now()
     if self._verbose >= 1:
       tf_logging.info("Reading training dataset...")
 
     coordinator = None
-    if distribution_config is None:
+    if distribution_config is None or not self.support_distributed_training():
       # Local training.
 
       # Wraps the input training dataset into a tf.data.Dataset like object.
@@ -1163,7 +1405,8 @@ class CoreModel(InferenceCoreModel):
           y=y,
           sample_weight=sample_weight,
           model=self,
-          class_weight=class_weight)
+          class_weight=class_weight,
+      )
       iterator = iter(data_handler._dataset)  # pylint: disable=protected-access
 
       if steps_per_epoch is None:
@@ -1171,8 +1414,9 @@ class CoreModel(InferenceCoreModel):
 
         # Load the entire training dataset in Yggdrasil in a single TensorFlow
         # step.
-        self._num_training_examples = self._consumes_training_examples_until_eof(
-            iterator)
+        self._num_training_examples = (
+            self._consumes_training_examples_until_eof(iterator)
+        )
 
       else:
         # Local training with number of steps.
@@ -1183,14 +1427,16 @@ class CoreModel(InferenceCoreModel):
             "This solution will lead to a sub-optimal model. Instead, "
             "use a finite training dataset (e.g. a dataset without "
             "repeat operation) and remove the `steps_per_epoch` argument. "
-            "This warning will be turned into an error in the future.")
+            "This warning will be turned into an error in the future."
+        )
 
         def consumes_one_training_batch(iterator):
           data = next(iterator)
           return self.train_step(data)
 
         tf_consumes_one_training_batch = tf.function(
-            consumes_one_training_batch, reduce_retracing=True)
+            consumes_one_training_batch, reduce_retracing=True
+        )
 
         num_examples = 0
         try:
@@ -1203,28 +1449,32 @@ class CoreModel(InferenceCoreModel):
         # End of the logic to remove as mentionned in the TODO above.
 
     else:
-
       if class_weight is not None:
-        raise ValueError("class_weight not support for distributed training. "
-                         "Feed the example weights through the dataset.")
+        raise ValueError(
+            "class_weight not support for distributed training. "
+            "Feed the example weights through the dataset."
+        )
 
       # Distributed training
       if not self.capabilities().support_partial_cache_dataset_format:
         raise ValueError(
-            f"The model {type(self)} does not support training with a TF "
-            "Distribution strategy (i.e. model.capabilities()."
-            "support_partial_cache_dataset_format == False). If the dataset "
-            "is small, simply remove the distribution strategy scope (i.e. `with "
-            "strategy.scope():` around the model construction). If the dataset "
-            "is large, use a distributed version of the model. For example, "
-            "use DistributedGradientBoostedTreesModel instead of "
-            "GradientBoostedTreesModel.")
+            f"The model {type(self)} does not support training with a TF"
+            " Distribution strategy (i.e."
+            " model.capabilities().support_partial_cache_dataset_format =="
+            " False). If the dataset is small, simply remove the distribution"
+            " strategy scope (i.e. `with strategy.scope():` around the model"
+            " construction). If the dataset is large, use a distributed"
+            " version of the model. For example, use"
+            " DistributedGradientBoostedTreesModel instead of"
+            " GradientBoostedTreesModel."
+        )
 
       # Make the workers read the entire dataset.
       # If a worker is interrupted, it restarts reading its part of the dataset
       # from the start.
       coordinator = tf.distribute.experimental.coordinator.ClusterCoordinator(
-          self.distribute_strategy)
+          self.distribute_strategy
+      )
       with self.distribute_strategy.scope():
         per_worker_dataset = coordinator.create_per_worker_dataset(x)
       per_worker_iter = iter(per_worker_dataset)
@@ -1238,19 +1488,22 @@ class CoreModel(InferenceCoreModel):
             "You are using distributed training with steps_per_epoch. "
             "This solution will lead to a sub-optimal model. Instead, "
             "use a finite training dataset (e.g. a dataset without "
-            "repeat operation) and remove the `steps_per_epoch` argument.")
+            "repeat operation) and remove the `steps_per_epoch` argument."
+        )
 
         def remote_consumes_one_training_batch(iterator):
           data = next(iterator)
           self.train_step(data)
 
         tf_remote_consumes_one_training_batch = tf.function(
-            remote_consumes_one_training_batch, reduce_retracing=True)
+            remote_consumes_one_training_batch, reduce_retracing=True
+        )
 
         tf_logging.info("Scheduling of %d steps", steps_per_epoch)
         for _ in range(steps_per_epoch):
           coordinator.schedule(
-              tf_remote_consumes_one_training_batch, args=(per_worker_iter,))
+              tf_remote_consumes_one_training_batch, args=(per_worker_iter,)
+          )
         tf_logging.info("Waiting for scheduled steps to complete")
         coordinator.join()
 
@@ -1266,32 +1519,36 @@ class CoreModel(InferenceCoreModel):
           return self._consumes_training_examples_until_eof(iterator)
 
         tf_remote_consumes_training_examples_until_eof = tf.function(
-            remote_consumes_training_examples_until_eof, reduce_retracing=True)
+            remote_consumes_training_examples_until_eof, reduce_retracing=True
+        )
 
         # TODO: Replace with an coordinator.schedule version when
         # available.
         self._num_training_examples = tf_core.execute_function_on_each_worker(
-            coordinator, tf_remote_consumes_training_examples_until_eof,
-            (per_worker_iter,))
+            coordinator,
+            tf_remote_consumes_training_examples_until_eof,
+            (per_worker_iter,),
+        )
 
     if self._verbose >= 1:
-      tf_logging.info("Training dataset read in %s. Found %d examples.",
-                      datetime.now() - time_begin_train_dataset_reading,
-                      self._num_training_examples)
+      t = datetime.now() - time_begin_train_dataset_reading
+      tf_logging.info(
+          f"Training dataset read in {t}. Found"
+          f" {self._num_training_examples} examples."
+      )
 
     # Load the validation dataset
     if validation_data is not None:
-
       # Collect the validation dataset in Yggdrasil.
-      if coordinator is not None:
-
+      if coordinator is not None and self.support_distributed_training():
         # TODO: Collect the validation dataset in yggdrasil when using
         # distributed training.
         assert validation_data_handler is None
 
         tf_logging.warning(
             "With distributed training, the validation dataset is not (yet) "
-            "used for early stopping.")
+            "used for early stopping."
+        )
         self._num_validation_examples = None
 
       else:
@@ -1307,11 +1564,11 @@ class CoreModel(InferenceCoreModel):
         if validation_steps is None:
           # Validation with finite dataset.
 
-          self._num_validation_examples = self._consumes_validation_examples_until_eof(
-              iterator)
+          self._num_validation_examples = (
+              self._consumes_validation_examples_until_eof(iterator)
+          )
 
         else:
-
           # Validation with number of steps.
           # TODO: Make this case an error and remove this code.
           tf_logging.warning(
@@ -1319,14 +1576,16 @@ class CoreModel(InferenceCoreModel):
               "This solution will lead to a sub-optimal model. Instead, "
               "use a finite validation dataset (e.g. a dataset without "
               "repeat operation) and remove the `validation_steps` argument. "
-              "This warning will be turned into an error in the future.")
+              "This warning will be turned into an error in the future."
+          )
 
           def consumes_one_valid_batch(iterator):
             data = next(iterator)
             return self.valid_step(data)
 
           tf_consumes_one_valid_batch = tf.function(
-              consumes_one_valid_batch, reduce_retracing=True)
+              consumes_one_valid_batch, reduce_retracing=True
+          )
 
           num_examples = 0
           try:
@@ -1338,13 +1597,16 @@ class CoreModel(InferenceCoreModel):
 
           # End of the logic to remove as mentionned in the TODO above.
 
-        tf_logging.info("Num validation examples: %s",
-                        self.num_validation_examples)
+        tf_logging.info(
+            "Num validation examples: %s", self.num_validation_examples
+        )
 
         if self._verbose >= 1:
-          tf_logging.info("Validation dataset read in %s. Found %d examples.",
-                          datetime.now() - time_begin_valid_dataset_reading,
-                          self._num_validation_examples)
+          t = datetime.now() - time_begin_valid_dataset_reading
+          tf_logging.info(
+              f"Validation dataset read in {t}. Found"
+              f" {self._num_validation_examples} examples."
+          )
 
     # Train the model
     # Note: The model should be trained after having collected both the training
@@ -1357,15 +1619,18 @@ class CoreModel(InferenceCoreModel):
     self._train_model(cluster_coordinator=coordinator)
 
     if self._verbose >= 1:
-      tf_logging.info("Model trained in %s",
-                      datetime.now() - time_begin_training_model)
+      tf_logging.info(
+          "Model trained in %s", datetime.now() - time_begin_training_model
+      )
 
     # Load the inference ops of the model.
     self._build(x)
 
     # Evaluate the model using Keras
-    if (validation_data is not None and
-        not self._advanced_arguments.populate_history_with_yggdrasil_logs):
+    if (
+        validation_data is not None
+        and not self._advanced_arguments.populate_history_with_yggdrasil_logs
+    ):
       # Note: the "validation_data_handler" is exausted and cannot be reused
       # with the model evaluation (i.e. _use_cached_eval_dataset=True).
 
@@ -1381,7 +1646,8 @@ class CoreModel(InferenceCoreModel):
           sample_weight=val_sample_weight,
           return_dict=True,
           steps=validation_steps,
-          callbacks=callbacks)
+          callbacks=callbacks,
+      )
 
       val_logs = {"val_" + name: val for name, val in val_logs.items()}
       callbacks.on_epoch_end(0, val_logs)
@@ -1399,16 +1665,17 @@ class CoreModel(InferenceCoreModel):
   def fit_on_dataset_path(
       self,
       train_path: str,
-      label_key: str,
+      label_key: Optional[str] = None,
       weight_key: Optional[str] = None,
-      ranking_key: Optional[str] = None,
       valid_path: Optional[str] = None,
       dataset_format: Optional[str] = "csv",
       max_num_scanned_rows_to_accumulate_statistics: Optional[int] = 100_000,
       try_resume_training: Optional[bool] = True,
       input_model_signature_fn: Optional[tf_core.InputModelSignatureFn] = (
-          tf_core.build_default_input_model_signature),
-      num_io_threads: int = 10):
+          tf_core.build_default_input_model_signature
+      ),
+      num_io_threads: int = 10,
+  ):
     """Trains the model on a dataset stored on disk.
 
     This solution is generally more efficient and easier than loading the
@@ -1425,7 +1692,7 @@ class CoreModel(InferenceCoreModel):
         dataset_format="csv")
       model.save("/model/path")
       ```
-      
+
       # Distributed training
       ```python
       with tf.distribute.experimental.ParameterServerStrategy(...).scope():
@@ -1436,19 +1703,20 @@ class CoreModel(InferenceCoreModel):
         dataset_format="tfrecord+tfe")
       model.save("/model/path")
       ```
-      
+
     Args:
-      train_path: Path to the training dataset. Supports comma separated files, shard and glob notation.
+      train_path: Path to the training dataset. Supports comma separated files,
+        shard and glob notation.
       label_key: Name of the label column.
       weight_key: Name of the weighing column.
-      ranking_key: Name of the ranking column.
       valid_path: Path to the validation dataset. If not provided, or if the
-               learning algorithm does not supports/needs a validation dataset,
-               `valid_path` is ignored.
+        learning algorithm does not supports/needs a validation dataset,
+        `valid_path` is ignored.
       dataset_format: Format of the dataset. Should be one of the registered
-         dataset format (see [User Manual](https://github.com/google/yggdrasil-decision-forests/blob/main/documentation/user_manual.md#dataset-path-and-format)
-           for more details). The format "csv" is always available but it is
-           generally only suited for small datasets.
+        dataset format (see [User
+        Manual](https://github.com/google/yggdrasil-decision-forests/blob/main/documentation/user_manual.md#dataset-path-and-format)
+        for more details). The format "csv" is always available but it is
+        generally only suited for small datasets.
       max_num_scanned_rows_to_accumulate_statistics: Maximum number of examples
         to scan to determine the statistics of the features (i.e. the dataspec,
         e.g. mean value, dictionaries). (Currently) the "first" examples of the
@@ -1494,116 +1762,142 @@ class CoreModel(InferenceCoreModel):
     if not self._is_compiled:
       self.compile()
 
+    train_path = _improve_dataset_path(train_path)
+    valid_path = _improve_dataset_path(valid_path)
+
     train_model_path = self._temp_directory
     model_path = os.path.join(train_model_path, "model")
 
-    # Create the dataspec guide.
-    guide = data_spec_pb2.DataSpecificationGuide(
-        ignore_columns_without_guides=self._exclude_non_specified,
-        max_num_scanned_rows_to_accumulate_statistics=max_num_scanned_rows_to_accumulate_statistics,
-        detect_numerical_as_discretized_numerical=self
-        ._discretize_numerical_features)
-    guide.default_column_guide.categorial.max_vocab_count = self._max_vocab_count
-    guide.default_column_guide.discretized_numerical.maximum_num_bins = self._num_discretized_numerical_bins
+    training_config = self._advanced_arguments.yggdrasil_training_config
 
-    self._normalized_input_keys = []
-    for feature in self._features:
-      col_guide = copy.deepcopy(feature.guide)
-      col_guide.column_name_pattern = tf_core.normalize_inputs_regexp(
-          feature.name)
-      guide.column_guides.append(col_guide)
-      self._normalized_input_keys.append(feature.name)
-
-    label_guide = data_spec_pb2.ColumnGuide(
-        column_name_pattern=tf_core.normalize_inputs_regexp(label_key))
-
-    if self._task == Task.CLASSIFICATION:
-      label_guide.type = data_spec_pb2.CATEGORICAL
-      label_guide.categorial.min_vocab_frequency = 0
-      label_guide.categorial.max_vocab_count = -1
-    elif self._task == Task.REGRESSION:
-      label_guide.type = data_spec_pb2.NUMERICAL
-    elif self._task == Task.RANKING:
-      label_guide.type = data_spec_pb2.NUMERICAL
+    if self._is_multitask:
+      if label_key is not None:
+        raise ValueError(
+            "label_key cannot be specified for multitask models. Use the "
+            '"multitask" model constructor argument instead.'
+        )
     else:
-      raise ValueError(
-          f"Non implemented task {self._task} with \"fit_on_dataset_path\"."
-          " Use a different task or train with \"fit\".")
-    guide.column_guides.append(label_guide)
+      if label_key is None:
+        raise ValueError("label_key argument not set")
+      training_config.label = tf_core.normalize_inputs_regexp(label_key, False)
+      self._multitask[0] = self._multitask[0]._replace(label=label_key)
 
-    if ranking_key:
+    # Create the dataspec guide.
+    guide = self._build_guide(max_num_scanned_rows_to_accumulate_statistics)
+
+    if training_config.HasField("ranking_group"):
       ranking_guide = data_spec_pb2.ColumnGuide(
-          column_name_pattern=tf_core.normalize_inputs_regexp(ranking_key),
-          type=data_spec_pb2.HASH)
+          column_name_pattern=tf_core.normalize_inputs_regexp(
+              training_config.ranking_group, False
+          ),
+          type=data_spec_pb2.HASH,
+      )
+      guide.column_guides.append(ranking_guide)
+
+    if training_config.HasField("uplift_treatment"):
+      ranking_guide = data_spec_pb2.ColumnGuide(
+          column_name_pattern=tf_core.normalize_inputs_regexp(
+              training_config.uplift_treatment, False
+          ),
+          type=data_spec_pb2.CATEGORICAL
+          if training_config.task == Task.CATEGORICAL_UPLIFT
+          else data_spec_pb2.NUMERICAL,
+      )
       guide.column_guides.append(ranking_guide)
 
     if weight_key:
       weight_guide = data_spec_pb2.ColumnGuide(
-          column_name_pattern=tf_core.normalize_inputs_regexp(weight_key),
-          type=data_spec_pb2.NUMERICAL)
+          column_name_pattern=tf_core.normalize_inputs_regexp(
+              weight_key, False
+          ),
+          type=data_spec_pb2.NUMERICAL,
+      )
       guide.column_guides.append(weight_guide)
+      training_config.weight_definition.attribute = weight_key
+      training_config.weight_definition.numerical.SetInParent()
 
     # Deployment configuration
     deployment_config = copy.deepcopy(
-        self._advanced_arguments.yggdrasil_deployment_config)
+        self._advanced_arguments.yggdrasil_deployment_config
+    )
     if not deployment_config.HasField("num_threads"):
       deployment_config.num_threads = self._num_threads
     if not deployment_config.HasField("num_io_threads"):
       deployment_config.num_io_threads = num_io_threads
 
     distribution_config = tf_core.get_distribution_configuration(
-        self.distribute_strategy)
+        self.distribute_strategy
+    )
 
-    if distribution_config is not None and not self.capabilities(
-    ).support_partial_cache_dataset_format:
-      raise ValueError(
-          f"The model {type(self)} does not support training with a TF "
-          "Distribution strategy (i.e. model.capabilities()."
-          "support_partial_cache_dataset_format == False). If the dataset "
-          "is small, simply remove the distribution strategy scope (i.e. `with "
-          "strategy.scope():` around the model construction). If the dataset "
-          "is large, use a distributed version of the model. For Example, use "
-          "DistributedGradientBoostedTreesModel instead of "
-          "GradientBoostedTreesModel.")
+    cluster_coordinator = None
+    if distribution_config is not None:
+      if (
+          not self.capabilities().support_partial_cache_dataset_format
+          and self._tuner is None
+      ):
+        raise ValueError(
+            f"The model {type(self)} does not support training with a TF"
+            " Distribution strategy (i.e."
+            " model.capabilities().support_partial_cache_dataset_format =="
+            " False). If the dataset is small, simply remove the distribution"
+            " strategy scope (i.e. `with strategy.scope():` around the model"
+            " construction). If the dataset is large, use a distributed"
+            " version of the model. For Example, use"
+            " DistributedGradientBoostedTreesModel instead of"
+            " GradientBoostedTreesModel."
+        )
 
-    with tf_logging.capture_cpp_log_context(verbose=self._verbose >= 2):
+      cluster_coordinator = (
+          tf.distribute.experimental.coordinator.ClusterCoordinator(
+              self.distribute_strategy
+          )
+      )
+
+    with cc_logging.capture_cpp_log_context(verbose=self._verbose >= 2):
       # Train the model.
       tf_core.train_on_file_dataset(
           train_dataset_path=dataset_format + ":" + train_path,
-          valid_dataset_path=(dataset_format + ":" +
-                              valid_path) if valid_path else None,
-          feature_ids=self._normalized_input_keys,
-          label_id=label_key,
-          weight_id=weight_key,
+          valid_dataset_path=(dataset_format + ":" + valid_path)
+          if valid_path
+          else None,
           model_id=self._training_model_id,
           model_dir=train_model_path,
-          learner="",
-          task=self._task,
           generic_hparms=tf_core.hparams_dict_to_generic_proto(
-              self._learner_params),
-          ranking_group=ranking_key,
+              self._learner_params
+          ),
           keep_model_in_resource=True,
           guide=guide,
-          training_config=self._advanced_arguments.yggdrasil_training_config,
+          training_config=training_config,
           deployment_config=deployment_config,
-          working_cache_path=os.path.join(self._temp_directory,
-                                          "working_cache"),
+          working_cache_path=os.path.join(
+              self._temp_directory, "working_cache"
+          ),
           distribution_config=distribution_config,
-          try_resume_training=try_resume_training)
+          try_resume_training=try_resume_training,
+          cluster_coordinator=cluster_coordinator,
+          force_ydf_port=self._advanced_arguments.force_ydf_port,
+      )
 
       # Request and store a description of the model.
-      self._description = training_op.SimpleMLShowModel(
-          model_identifier=self._training_model_id).numpy().decode("utf-8")
+      self._description = (
+          training_op.SimpleMLShowModel(
+              model_identifier=self._training_model_id
+          )
+          .numpy()
+          .decode("utf-8")
+      )
       training_op.SimpleMLUnloadModel(model_identifier=self._training_model_id)
 
     # Build the model's graph.
     inspector = inspector_lib.make_inspector(
-        model_path, file_prefix=self._training_model_id)
+        model_path, file_prefix=self._training_model_id
+    )
     self._set_from_yggdrasil_model(
         inspector,
         model_path,
         file_prefix=self._training_model_id,
-        input_model_signature_fn=input_model_signature_fn)
+        input_model_signature_fn=input_model_signature_fn,
+    )
 
     # Build the model history.
     history = self._training_logs_to_history(inspector)
@@ -1613,7 +1907,7 @@ class CoreModel(InferenceCoreModel):
   def _add_training_logs_to_history(
       self,
       history: tf.keras.callbacks.History,
-      inspector: Optional[inspector_lib.AbstractInspector] = None
+      inspector: Optional[inspector_lib.AbstractInspector] = None,
   ) -> Optional[Dict[str, Any]]:
     if inspector is None:
       inspector = self.make_inspector()
@@ -1631,15 +1925,15 @@ class CoreModel(InferenceCoreModel):
     return last_logs
 
   def _training_logs_to_history(
-      self,
-      inspector: Optional[inspector_lib.AbstractInspector] = None
+      self, inspector: Optional[inspector_lib.AbstractInspector] = None
   ) -> tf.keras.callbacks.History:
     history = tf.keras.callbacks.History()
     history.model = self
     history.on_train_begin()
     history.on_epoch_begin(0)
     last_logs = self._add_training_logs_to_history(
-        history=history, inspector=inspector)
+        history=history, inspector=inspector
+    )
     history.on_epoch_end(0, last_logs)
     history.on_train_end()
     return history
@@ -1673,10 +1967,12 @@ class CoreModel(InferenceCoreModel):
       else:
         raise ValueError(
             f"A model already exist as {filepath}. Use an empty directory "
-            "or set overwrite=True")
+            "or set overwrite=True"
+        )
 
     super(CoreModel, self).save(
-        filepath=filepath, overwrite=overwrite, **kwargs)
+        filepath=filepath, overwrite=overwrite, **kwargs
+    )
 
   @staticmethod
   def predefined_hyperparameters() -> List[HyperParameterTemplate]:
@@ -1692,111 +1988,191 @@ class CoreModel(InferenceCoreModel):
 
     return []
 
+  def _build_guide(
+      self, max_num_scanned_rows_to_accumulate_statistics: Optional[int] = None
+  ):
+    guide = data_spec_pb2.DataSpecificationGuide(
+        ignore_columns_without_guides=self._exclude_non_specified,
+        detect_numerical_as_discretized_numerical=self._discretize_numerical_features,
+    )
+
+    if max_num_scanned_rows_to_accumulate_statistics is not None:
+      guide.max_num_scanned_rows_to_accumulate_statistics = (
+          max_num_scanned_rows_to_accumulate_statistics
+      )
+
+    guide.default_column_guide.categorial.max_vocab_count = (
+        self._max_vocab_count
+    )
+    guide.default_column_guide.discretized_numerical.maximum_num_bins = (
+        self._num_discretized_numerical_bins
+    )
+
+    # Labels
+    for sub_task in self._multitask:
+      label_guide = data_spec_pb2.ColumnGuide(
+          column_name_pattern=tf_core.normalize_inputs_regexp(
+              sub_task.label, False
+          )
+      )
+
+      if sub_task.task == Task.CLASSIFICATION:
+        label_guide.type = data_spec_pb2.CATEGORICAL
+        label_guide.categorial.min_vocab_frequency = 0
+        label_guide.categorial.max_vocab_count = -1
+      elif sub_task.task == Task.REGRESSION:
+        label_guide.type = data_spec_pb2.NUMERICAL
+      elif sub_task.task == Task.RANKING:
+        label_guide.type = data_spec_pb2.NUMERICAL
+      elif sub_task.task == Task.CATEGORICAL_UPLIFT:
+        label_guide.type = data_spec_pb2.CATEGORICAL
+      elif sub_task.task == Task.NUMERICAL_UPLIFT:
+        label_guide.type = data_spec_pb2.NUMERICAL
+      else:
+        raise ValueError(
+            f'Non implemented task {sub_task.task} with "fit_on_dataset_path".'
+            ' Use a different task or train with "fit".'
+        )
+      guide.column_guides.append(label_guide)
+
+    # Features
+    for feature in self._features:
+      col_guide = copy.deepcopy(feature.guide)
+      col_guide.column_name_pattern = tf_core.normalize_inputs_regexp(
+          feature.name, False
+      )
+      guide.column_guides.append(col_guide)
+
+    return guide
+
   def _train_model(self, cluster_coordinator=None):
     """Effectively train the model."""
 
-    if self._normalized_input_keys is None:
+    if self._normalized_input_feature_keys is None:
       raise Exception("The training graph was not built.")
 
     train_model_path = self._temp_directory
     model_path = os.path.join(train_model_path, "model")
 
     # Create the dataspec guide.
-    guide = data_spec_pb2.DataSpecificationGuide(
-        detect_numerical_as_discretized_numerical=self
-        ._discretize_numerical_features)
-    guide.default_column_guide.categorial.max_vocab_count = self._max_vocab_count
-    guide.default_column_guide.discretized_numerical.maximum_num_bins = self._num_discretized_numerical_bins
+    guide = self._build_guide()
 
-    for feature in self._features:
-      col_guide = copy.deepcopy(feature.guide)
-      col_guide.column_name_pattern = tf_core.normalize_inputs_regexp(
-          feature.name)
-      guide.column_guides.append(col_guide)
+    training_config = copy.deepcopy(
+        self._advanced_arguments.yggdrasil_training_config
+    )
+
+    if self._weighted_training:
+      training_config.weight_definition.attribute = WEIGHTS
+      training_config.weight_definition.numerical.SetInParent()
+
+    # Features
+    for feature_key in self._normalized_input_feature_keys:
+      feature_regex = tf_core.normalize_inputs_regexp(feature_key, False)
+      training_config.features.append(feature_regex)
 
     # Deployment configuration
     deployment_config = copy.deepcopy(
-        self._advanced_arguments.yggdrasil_deployment_config)
+        self._advanced_arguments.yggdrasil_deployment_config
+    )
     if not deployment_config.HasField("num_threads"):
       deployment_config.num_threads = self._num_threads
 
     distribution_config = tf_core.get_distribution_configuration(
-        self.distribute_strategy)
+        self.distribute_strategy
+    )
 
-    with tf_logging.capture_cpp_log_context(verbose=self._verbose >= 2):
+    resource_ids, feature_names = tf_core.column_keys_to_resource_ids(
+        self._normalized_column_keys, self._training_model_id, True
+    )
 
-      if distribution_config is None:
+    with cc_logging.capture_cpp_log_context(verbose=self._verbose >= 2):
+      if distribution_config is None or not self.support_distributed_training():
         # Train the model.
         # The model will be exported to "train_model_path".
         #
         # Note: It would be possible to train and load the model without saving
         # the model to file.
         tf_core.train(
-            input_ids=self._normalized_input_keys,
-            label_id=_LABEL,
-            weight_id=_WEIGHTS if self._weighted_training else None,
+            resource_ids=resource_ids,
             model_id=self._training_model_id,
             model_dir=train_model_path,
-            learner="",
-            task=self._task,
             generic_hparms=tf_core.hparams_dict_to_generic_proto(
-                self._learner_params),
-            ranking_group=_RANK_GROUP if self._task == Task.RANKING else None,
-            uplift_treatment=_UPLIFT_TREATMENT if self._task
-            in [Task.CATEGORICAL_UPLIFT, Task.NUMERICAL_UPLIFT] else None,
+                self._learner_params
+            ),
             keep_model_in_resource=True,
             guide=guide,
-            training_config=self._advanced_arguments.yggdrasil_training_config,
+            training_config=training_config,
             deployment_config=deployment_config,
             try_resume_training=self._try_resume_training,
-            has_validation_dataset=self._has_validation_dataset)
+            has_validation_dataset=self._has_validation_dataset,
+            node_format=self._advanced_arguments.node_format,
+        )
 
       else:
         tf_core.finalize_distributed_dataset_collection(
             cluster_coordinator=cluster_coordinator,
-            input_ids=self._normalized_input_keys + [_LABEL] +
-            ([_WEIGHTS] if self._weighted_training else []),
-            model_id=self._training_model_id,
-            dataset_path=self._distributed_partial_dataset_cache_path())
+            resource_ids=resource_ids,
+            feature_names=feature_names,
+            dataset_path=self._distributed_partial_dataset_cache_path(),
+        )
 
         tf_core.train_on_file_dataset(
-            train_dataset_path="partial_dataset_cache:" +
-            self._distributed_partial_dataset_cache_path(),
+            train_dataset_path="partial_dataset_cache:"
+            + self._distributed_partial_dataset_cache_path(),
             valid_dataset_path=None,
-            feature_ids=self._normalized_input_keys,
-            label_id=_LABEL,
-            weight_id=_WEIGHTS if self._weighted_training else None,
             model_id=self._training_model_id,
             model_dir=train_model_path,
-            learner="",
-            task=self._task,
             generic_hparms=tf_core.hparams_dict_to_generic_proto(
-                self._learner_params),
-            ranking_group=_RANK_GROUP if self._task == Task.RANKING else None,
-            uplift_treatment=_UPLIFT_TREATMENT if self._task
-            in [Task.CATEGORICAL_UPLIFT, Task.NUMERICAL_UPLIFT] else None,
+                self._learner_params
+            ),
             keep_model_in_resource=True,
             guide=guide,
-            training_config=self._advanced_arguments.yggdrasil_training_config,
+            training_config=training_config,
             deployment_config=deployment_config,
-            working_cache_path=os.path.join(self._temp_directory,
-                                            "working_cache"),
+            working_cache_path=os.path.join(
+                self._temp_directory, "working_cache"
+            ),
             distribution_config=distribution_config,
-            try_resume_training=self._try_resume_training)
+            try_resume_training=self._try_resume_training,
+            cluster_coordinator=cluster_coordinator,
+            node_format=self._advanced_arguments.node_format,
+            force_ydf_port=self._advanced_arguments.force_ydf_port,
+        )
 
       # Request and store a description of the model.
-      self._description = training_op.SimpleMLShowModel(
-          model_identifier=self._training_model_id).numpy().decode("utf-8")
+      self._description = (
+          training_op.SimpleMLShowModel(
+              model_identifier=self._training_model_id
+          )
+          .numpy()
+          .decode("utf-8")
+      )
       training_op.SimpleMLUnloadModel(model_identifier=self._training_model_id)
 
       self._is_trained.assign(True)
 
       # Load and optimize the model in memory.
       # Register the model as a SavedModel asset.
-      additional_args = {}
-      additional_args["file_prefix"] = self._training_model_id
-      self._model = tf_op.ModelV2(
-          model_path=model_path, verbose=False, **additional_args)
+      if self._is_multitask:
+        self._models = []
+        for task_idx in range(len(self._multitask)):
+          self._models.append(
+              tf_op.ModelV2(
+                  model_path=model_path,
+                  verbose=False,
+                  file_prefix=f"{self._training_model_id}_{task_idx}",
+                  allow_slow_inference=self._advanced_arguments.allow_slow_inference,
+              )
+          )
+      else:
+        self._models = [
+            tf_op.ModelV2(
+                model_path=model_path,
+                verbose=False,
+                file_prefix=self._training_model_id,
+                allow_slow_inference=self._advanced_arguments.allow_slow_inference,
+            )
+        ]
 
   @staticmethod
   def capabilities() -> abstract_learner_pb2.LearnerCapabilities:
@@ -1804,15 +2180,35 @@ class CoreModel(InferenceCoreModel):
 
     return abstract_learner_pb2.LearnerCapabilities()
 
+  def _check_parameters(self):
+    """Check the validity of the learner parameters."""
+
+    training_config = copy.deepcopy(
+        self._advanced_arguments.yggdrasil_training_config
+    )
+
+    if self._weighted_training:
+      training_config.weight_definition.attribute = WEIGHTS
+      training_config.weight_definition.numerical.SetInParent()
+
+    tf_core.check_config(
+        training_config=training_config,
+        generic_hparms=tf_core.hparams_dict_to_generic_proto(
+            self._learner_params
+        ),
+    )
+
 
 def _list_explicit_arguments(func):
   """Function decorator that adds an "explicit_args" with the explicit args."""
 
   arguments = inspect.getfullargspec(func)[0]
 
+  @functools.wraps(func)
   def wrapper(*args, **kargs):
     kargs["explicit_args"] = set(
-        list(arguments[:len(args)]) + list(kargs.keys()))
+        list(arguments[: len(args)]) + list(kargs.keys())
+    )
     return func(*args, **kargs)
 
   return wrapper
@@ -1833,8 +2229,10 @@ def _parse_hp_template(template_name) -> Tuple[str, Optional[int]]:
     Base template name and version.
   """
 
-  malformed_msg = (f"The template \"{template_name}\" is malformed. Expecting "
-                   "\"{template}@v{version}\" or \"{template}")
+  malformed_msg = (
+      f'The template "{template_name}" is malformed. Expecting '
+      '"{template}@v{version}" or "{template}'
+  )
 
   if "@" in template_name:
     # Template with version.
@@ -1854,8 +2252,8 @@ def _parse_hp_template(template_name) -> Tuple[str, Optional[int]]:
 
 
 def _get_matching_template(
-    template_name: str,
-    all_templates: List[HyperParameterTemplate]) -> HyperParameterTemplate:
+    template_name: str, all_templates: List[HyperParameterTemplate]
+) -> HyperParameterTemplate:
   """Returns the template that matches a template name.
 
   Args:
@@ -1874,16 +2272,20 @@ def _get_matching_template(
 
     # Matching templates.
     matching = [
-        template for template in all_templates if
-        template.name == template_base and template.version == template_version
+        template
+        for template in all_templates
+        if template.name == template_base
+        and template.version == template_version
     ]
 
     if not matching:
       available = [
           f"{template.name}@v{template.version}" for template in all_templates
       ]
-      raise ValueError(f"No template is matching {template_name}. "
-                       f"The available templates are: {available}")
+      raise ValueError(
+          f"No template is matching {template_name}. "
+          f"The available templates are: {available}"
+      )
 
     if len(matching) > 1:
       raise ValueError("Internal error. Multiple matching templates")
@@ -1898,14 +2300,19 @@ def _get_matching_template(
 
     if not matching:
       available = list(set([template.name for template in all_templates]))
-      raise ValueError(f"No template is matching {template_name}. "
-                       f"Available template names are: {available}")
+      raise ValueError(
+          f"No template is matching {template_name}. "
+          f"Available template names are: {available}"
+      )
     return matching[0]
 
 
-def _apply_hp_template(parameters: Dict[str, Any], template_name: str,
-                       all_templates: List[HyperParameterTemplate],
-                       explicit_parameters: Set[str]) -> Dict[str, Any]:
+def _apply_hp_template(
+    parameters: Dict[str, Any],
+    template_name: str,
+    all_templates: List[HyperParameterTemplate],
+    explicit_parameters: Set[str],
+) -> Dict[str, Any]:
   """Applies the hyper-parameter template to the user+default parameters.
 
   Look for a template called "template_name" (is "template_name" is a versioned
@@ -1928,8 +2335,12 @@ def _apply_hp_template(parameters: Dict[str, Any], template_name: str,
 
   template = _get_matching_template(template_name, all_templates)
   tf_logging.info(
-      "Resolve hyper-parameter template \"%s\" to \"%s@v%d\" -> %s.",
-      template_name, template.name, template.version, template.parameters)
+      'Resolve hyper-parameter template "%s" to "%s@v%d" -> %s.',
+      template_name,
+      template.name,
+      template.version,
+      template.parameters,
+  )
 
   for key in list(parameters.keys()):
     if key in template.parameters and key not in explicit_parameters:
@@ -1949,7 +2360,8 @@ def _check_feature_names(feature_names: List[str], raise_error: bool):
         "the argument `fix_feature_names=True` if you are using "
         "`pd_dataframe_to_tf_dataset`. (2) Disable this error message "
         "(`fail_on_non_keras_compatible_feature_name=False`) and only use part"
-        " of the compatible Keras API.")
+        " of the compatible Keras API."
+    )
     if raise_error:
       raise ValueError(full_reason)
     else:
@@ -1962,8 +2374,10 @@ def _check_feature_names(feature_names: List[str], raise_error: bool):
 
     for character in _FORBIDDEN_FEATURE_CHARACTERS:
       if character in feature_name:
-        problem(f"The feature name \"{feature_name}\" contains a forbidden "
-                f"character ({_FORBIDDEN_FEATURE_CHARACTERS!r}).")
+        problem(
+            f'The feature name "{feature_name}" contains a forbidden '
+            f"character ({_FORBIDDEN_FEATURE_CHARACTERS!r})."
+        )
 
 
 def _check_dataset(ds: tf.data.Dataset):
@@ -1976,14 +2390,17 @@ def _check_dataset(ds: tf.data.Dataset):
   """
 
   def error(message):
-    message += (" Alternatively, you can disabled this check with the "
-                "constructor argument `check_dataset=False`. If this message "
-                "is a false positive, please let us know so we can improve "
-                "this dataset check logic.")
+    message += (
+        " Alternatively, you can disabled this check with the "
+        "constructor argument `check_dataset=False`. If this message "
+        "is a false positive, please let us know so we can improve "
+        "this dataset check logic."
+    )
     if ONLY_WARN_ON_DATASET_CONFIGURATION_ISSUES:
       message += (
           " This warning will be turned into an error on "
-          "[18 Jan. 2022]. Make sure to solve this issue before this date.")
+          "[18 Jan. 2022]. Make sure to solve this issue before this date."
+      )
       tf_logging.warning(message)
     else:
       raise ValueError(message)
@@ -1993,7 +2410,8 @@ def _check_dataset(ds: tf.data.Dataset):
         "The dataset contains a 'repeat' operation. For maximum quality, TF-DF "
         "models should be trained without repeat operations as the dataset "
         "should only be read once. Remove the repeat operations to solve this "
-        "issue.")
+        "issue."
+    )
 
   if _contains_shuffle(ds):
     error(
@@ -2001,13 +2419,16 @@ def _check_dataset(ds: tf.data.Dataset):
         "TF-DF models should be trained without shuffle operations to make the "
         "algorithm deterministic. To make the the algorithm non deterministic, "
         "change the `random_seed` constructor argument instead. Remove the "
-        "shuffle operations to solve this issue.")
+        "shuffle operations to solve this issue."
+    )
 
   batch_size = _get_batch_size(ds)
   if not isinstance(ds, load_op._LoadDataset) and batch_size is None:  # pylint: disable=protected-access
-    error("The dataset does not contain a 'batch' operation. TF-DF models "
-          "should be trained with batch operations. Add a batch operations "
-          "to solve this issue.")
+    error(
+        "The dataset does not contain a 'batch' operation. TF-DF models "
+        "should be trained with batch operations. Add a batch operations "
+        "to solve this issue."
+    )
 
   num_examples = None
   try:
@@ -2015,18 +2436,22 @@ def _check_dataset(ds: tf.data.Dataset):
   except:  # pylint: disable=bare-except
     pass
 
-  if (num_examples is None or
-      num_examples > 2000) and batch_size is not None and batch_size < 100:
-    error(f"The dataset has a small batch size ({batch_size}). TF-DF model "
-          "quality is not impacted by the batch size. However, a small batch "
-          "size slow down the dataset reading and training preparation. Use "
-          "a batch size of at least 100 (1000 if even better) for a "
-          "dataset with more than 2k examples to solve this issue.")
+  if (
+      (num_examples is None or num_examples > 2000)
+      and batch_size is not None
+      and batch_size < 100
+  ):
+    error(
+        f"The dataset has a small batch size ({batch_size}). TF-DF model "
+        "quality is not impacted by the batch size. However, a small batch "
+        "size slow down the dataset reading and training preparation. Use "
+        "a batch size of at least 100 (1000 if even better) for a "
+        "dataset with more than 2k examples to solve this issue."
+    )
 
 
 def _get_operation(dataset, cls):
-  """Returns an operation defined by cls if present in dataset or else `None`.
-  """
+  """Returns an operation defined by cls if present in dataset or else `None`."""
   try:
     if not isinstance(dataset, tf.data.Dataset):
       return None
@@ -2074,3 +2499,12 @@ def _get_batch_size(dataset) -> Optional[int]:
   if operation is not None and hasattr(operation, "_batch_size"):
     return operation._batch_size  # pylint: disable=protected-access
   return None
+
+
+def _improve_dataset_path(path) -> Optional[str]:
+  """Make some improvements to a dataset."""
+
+  if path is None:
+    return None
+
+  return path

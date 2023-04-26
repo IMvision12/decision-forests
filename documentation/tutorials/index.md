@@ -4,6 +4,10 @@ The following notebooks are available:
 
 -   [Beginner Colab](beginner_colab.ipynb): Learn about the basic about model
     training, evaluation and exportation.
+-   [Visualizing Trees](dtreeviz_colab.ipynb): How to visualize and
+    interpret decision trees using [dtreeviz](https://github.com/parrt/dtreeviz).
+-   [Ranking Colab](ranking_colab.ipynb): Learn about ranking with decision
+    forests.
 -   [Intermediate Colab](intermediate_colab.ipynb): How to consume text and
     combine decision forest with neural networks.
 -   [Advanced Colab](advanced_colab.ipynb): How to inspect and create model

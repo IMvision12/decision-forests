@@ -26,8 +26,11 @@
 #   # Make sure the package are compatible with manylinux2014.
 #   ./tools/build_pip_package.sh ALL_VERSIONS
 #
-#   # Generate the pip package cross-compiled for Apple ARM64 machines
-#   ./tools/build_pip_package.sh MAC_ARM64_CROSS_COMPILED
+#   # Generate the pip package for Apple ARM64 machines
+#   ./tools/build_pip_package.sh ALL_VERSIONS_MAC_ARM64
+#
+#   # Generate the pip package for Apple Intel machines from Apple CPU machines
+#   ./tools/build_pip_package.sh ALL_VERSIONS_MAC_INTEL_CROSSCOMPILE
 #
 # Requirements:
 #
@@ -36,6 +39,7 @@
 #     Will be installed by this script if INSTALL_PYENV is set to INSTALL_PYENV.
 #
 #   Auditwheel
+#     Auditwheel is required for Linux builds.
 #     Auditwheel needs to be version 5.2.0. The script will attempt to
 #     update Auditwheel to this version.
 #
@@ -96,18 +100,17 @@ function assemble_files() {
   mkdir -p ${SRCPK}
   cp -R tensorflow_decision_forests LICENSE configure/setup.py configure/MANIFEST.in README.md ${SRCPK}
 
+  # When cross-compiling, adapt the platform string.
+  if [ ${ARG} == "ALL_VERSIONS_MAC_INTEL_CROSSCOMPILE" ]; then
+    sed -i'.bak' -e "s/# plat = \"macosx_10_14_x86_64\"/plat = \"macosx_10_14_x86_64\"/" ${SRCPK}/setup.py
+  fi
+
   # TFDF's wrappers and .so.
   SRCBIN="bazel-bin/tensorflow_decision_forests"
   cp ${SRCBIN}/tensorflow/ops/inference/inference.so ${SRCPK}/tensorflow_decision_forests/tensorflow/ops/inference/
   cp ${SRCBIN}/tensorflow/ops/training/training.so ${SRCPK}/tensorflow_decision_forests/tensorflow/ops/training/
 
-  # TODO: Include when Pip package support distributed training.
-  # cp ${SRCBIN}/tensorflow/distribute/distribute.so ${SRCPK}/tensorflow_decision_forests/tensorflow/distribute/
-
   cp ${SRCBIN}/keras/wrappers.py ${SRCPK}/tensorflow_decision_forests/keras/
-
-  # TFDF's proto wrappers.
-  cp ${SRCBIN}/tensorflow/distribute/tf_distribution_pb2.py ${SRCPK}/tensorflow_decision_forests/tensorflow/distribute/
 
   # Distribution server binaries
   cp ${SRCBIN}/keras/grpc_worker_main ${SRCPK}/tensorflow_decision_forests/keras/
@@ -137,8 +140,8 @@ function build_package() {
 
 # Tests a pip package.
 function test_package() {
-  if [ ${ARG} == "MAC_ARM64_CROSS_COMPILED" ]; then
-    echo "Cross-compiled packages cannot be tested automatically."
+  if [ ${ARG} == "ALL_VERSIONS_MAC_INTEL_CROSSCOMPILE" ]; then
+    echo "Cross-compiled packages cannot be tested on the machine they're built with."
     return
   fi
   PYTHON="$1"
@@ -189,17 +192,17 @@ function e2e_native() {
   PACKAGE=$(python_to_package_version ${PYTHON})
 
   install_dependencies ${PYTHON}
-  check_auditwheel ${PYTHON}
   build_package ${PYTHON}
 
   # Fix package.
   if is_macos; then
     PACKAGEPATH="dist/tensorflow_decision_forests-*-cp${PACKAGE}-cp${PACKAGE}*-*.whl"
   else
+    check_auditwheel ${PYTHON}
     PACKAGEPATH="dist/tensorflow_decision_forests-*-cp${PACKAGE}-cp${PACKAGE}*-linux_x86_64.whl"
+    TF_DYNAMIC_FILENAME="libtensorflow_framework.so.2"
+    ${PYTHON} -m auditwheel repair --plat manylinux2014_x86_64 -w dist --exclude ${TF_DYNAMIC_FILENAME} ${PACKAGEPATH}
   fi
-  TF_DYNAMIC_FILENAME="libtensorflow_framework.so.2"
-  ${PYTHON} -m auditwheel repair --plat manylinux2014_x86_64 -w dist --exclude ${TF_DYNAMIC_FILENAME} ${PACKAGEPATH}
 
   test_package ${PYTHON} ${PACKAGE}
 }
@@ -215,7 +218,7 @@ function e2e_pyenv() {
   ENVNAME=env_${VERSION}
   pyenv install ${VERSION} -s
 
-  # Enable pyenv
+  # Enable pyenv virtual environment.
   set +e
   pyenv virtualenv ${VERSION} ${ENVNAME}
   set -e
@@ -223,7 +226,7 @@ function e2e_pyenv() {
 
   e2e_native python3
 
-  # Disable pyenv
+  # Disable virtual environment.
   pyenv deactivate
 }
 
@@ -234,7 +237,7 @@ shift | true
 if [ ${INSTALL_PYENV} == "INSTALL_PYENV" ]; then 
   if ! [ -x "$(command -v pyenv)" ]; then
     echo "Pyenv not found."
-    echo "Installing build deps, pyenv 2.3.5 and pyenv virtualenv 1.1.5"
+    echo "Installing build deps, pyenv 2.3.7 and pyenv virtualenv 1.2.1"
     # Install python dependencies.
     sudo apt-get update
     sudo apt-get install -qq make build-essential libssl-dev zlib1g-dev \
@@ -243,13 +246,16 @@ if [ ${INSTALL_PYENV} == "INSTALL_PYENV" ]; then
               libffi-dev liblzma-dev patchelf
     git clone https://github.com/pyenv/pyenv.git
     (
-      cd pyenv && git checkout bb0f2ae1a7867a06c1692e00efd3abe2113b8f83
+      cd pyenv && git checkout 74f923b5fca82054b3c579f9eb936338c7f5a394
     )
     PYENV_ROOT="$(pwd)/pyenv"
     export PATH="$PYENV_ROOT/bin:$PATH"
     eval "$(pyenv init --path)"
     eval "$(pyenv init -)"
-    git clone --branch v1.1.5 https://github.com/pyenv/pyenv-virtualenv.git $(pyenv root)/plugins/pyenv-virtualenv
+    git clone https://github.com/pyenv/pyenv-virtualenv.git $(pyenv root)/plugins/pyenv-virtualenv
+    (
+      cd $(pyenv root)/plugins/pyenv-virtualenv && git checkout 13bc1877ef06ed038c65dcab4e901da6ea6c67ae
+    )
     eval "$(pyenv init --path)"
     eval "$(pyenv init -)"
     eval "$(pyenv virtualenv-init -)"
@@ -268,21 +274,28 @@ elif [ ${ARG} == "ALL_VERSIONS" ]; then
   eval "$(pyenv init -)"
   e2e_pyenv 3.9.12
   e2e_pyenv 3.8.13
-  e2e_pyenv 3.7.13
   e2e_pyenv 3.10.4
+  e2e_pyenv 3.11.0
 elif [ ${ARG} == "ALL_VERSIONS_ALREADY_ASSEMBLED" ]; then
   eval "$(pyenv init -)"
   e2e_pyenv 3.9.12
   e2e_pyenv 3.8.13
-  e2e_pyenv 3.7.13
   e2e_pyenv 3.10.4
-elif [ ${ARG} == "MAC_ARM64_CROSS_COMPILED" ]; then
+  e2e_pyenv 3.11.0
+elif [ ${ARG} == "ALL_VERSIONS_MAC_ARM64" ]; then
   eval "$(pyenv init -)"
   assemble_files
-  # Python 3.7 not supported for Mac ARM64
   e2e_pyenv 3.9.12
   e2e_pyenv 3.8.13
   e2e_pyenv 3.10.4
+  e2e_pyenv 3.11.0
+elif [ ${ARG} == "ALL_VERSIONS_MAC_INTEL_CROSSCOMPILE" ]; then
+  eval "$(pyenv init -)"
+  assemble_files
+  e2e_pyenv 3.9.12
+  e2e_pyenv 3.8.13
+  e2e_pyenv 3.10.4
+  e2e_pyenv 3.11.0
 else
   # Compile with a specific version of python provided in the call arguments.
   assemble_files

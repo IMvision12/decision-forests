@@ -18,6 +18,7 @@
 #include "tensorflow/core/framework/op.h"
 
 #include "tensorflow/core/framework/common_shape_fns.h"
+#include "tensorflow/core/framework/shape_inference.h"
 
 namespace tensorflow {
 
@@ -193,9 +194,9 @@ REGISTER_OP("SimpleMLChiefFinalizeFeatureOnFile")
 //   label_id: Feature accumulator containing the labels.
 //   weight_id: Feature accumulator containing the example weight. Empty string
 //     if no example weight are available.
-//   model_id: If set, exports the trained model in a resource called
-//     "model_id".
-//   model_dir: Export directory for the training logs and model. If not
+//   model_id: Identifier of the model during training. Used to set the name of
+//   the resources. model_dir: Export directory for the training logs and model.
+//   If not
 //     provided, the logs/model are/is not exported.
 //   learner: Yggdrasil learner name.
 //   hparams: Serialized abstract_learner_pb2.GenericHyperParameters proto.
@@ -219,27 +220,63 @@ REGISTER_OP("SimpleMLChiefFinalizeFeatureOnFile")
 //     the training dataset with the "__VALIDATION" postfix.
 //   use_file_prefix: If true, the model files are prefixed with the model_id.
 //     For internal use only.
+// create_model_resource: If true, exports the trained model in a resource
+//   called "model_id".
+// blocking: If true, waits for the training to finish before finishing the op
+//   execution. If false, returns immediately. In this case, use
+//   "SimpleMLCheckStatus" to follow the training progress.
+// node_format: Format for storing the model's nodes.
 //
 // Output:
-//   success: True iif. the training succeeded. The op can fail if: There are
-//     not training examples.
+//   process_id: Id of the process running the training. Use
+//   "SimpleMLCheckStatus" to check the execuction progress. Returns -1 if no
+//   process was started.
 REGISTER_OP("SimpleMLModelTrainer")
     .SetIsStateful()
-    .Attr("feature_ids: string")
-    .Attr("label_id: string")
-    .Attr("weight_id: string")
+    .Attr("resource_ids: list(string)")
     .Attr("model_id: string")
     .Attr("model_dir: string")
-    .Attr("learner: string")
     .Attr("hparams: string")
-    .Attr("task: int")
     .Attr("training_config: string")
     .Attr("deployment_config: string")
     .Attr("guide: string = ''")
     .Attr("has_validation_dataset: bool = false")
     .Attr("use_file_prefix: bool = false")
-    .Output("success: bool")
+    .Attr("create_model_resource: bool = true")
+    .Attr("blocking: bool = false")
+    .Attr("node_format: string = ''")
+    .Output("process_id: int32")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
+      c->set_output(0, c->Scalar());
+      return OkStatus();
+    });
+
+// Checks the status of a running process created with "SimpleMLModelTrainer".
+//
+// This function waits for kLongRunningProcessCheckTimeOut=10 seconds before
+// returning LongRunningProcessStatus::kInProgress (that is, the process is
+// still running).
+//
+// Usage example:
+//
+//   process_id = SimpleMLModelTrainer(...)
+//   if process_id != -1:
+//     while SimpleMLCheckStatus(...) == kInProgress:
+//       pass
+//
+// Args:
+//     "process_id": Identifier of the process to check.
+//
+// Output:
+//   status: Status of the process. See "RunningStatus" for the list of possible
+//   values.
+REGISTER_OP("SimpleMLCheckStatus")
+    .SetIsStateful()
+    .Input("process_id: int32")
+    .Output("status: int32")
+    .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
+      c->set_input_handle_shapes_and_types(
+          0, {shape_inference::ShapeAndType(c->Scalar(), DataType::DT_INT32)});
       c->set_output(0, c->Scalar());
       return OkStatus();
     });
@@ -264,9 +301,20 @@ REGISTER_OP("SimpleMLModelTrainerOnFile")
     .Attr("deployment_config: string")
     .Attr("guide: string = ''")
     .Attr("use_file_prefix: bool = false")
-    .Output("success: bool")
+    .Attr("create_model_resource: bool = true")
+    .Attr("node_format: string = ''")
+    .Output("process_id: int32")
     .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       c->set_output(0, c->Scalar());
+      return OkStatus();
+    });
+
+// Tests if the training configuration is correct.
+REGISTER_OP("SimpleMLCheckTrainingConfiguration")
+    .SetIsStateful()
+    .Attr("hparams: string")
+    .Attr("training_config: string")
+    .SetShapeFn([](::tensorflow::shape_inference::InferenceContext* c) {
       return OkStatus();
     });
 

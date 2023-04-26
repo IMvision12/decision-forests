@@ -1,5 +1,47 @@
 # Changelog
 
+## HEAD
+
+## 1.3.0 - 2023-03-23
+
+### Features
+
+-   Check learner parameters during the model construction.
+-   Fix discretized numerical features for regression task.
+-   Allow for float32 values to be fed as categorical features.
+-   Add new / improved tutorials for ranking and visualization.
+-   Compatibility with Tensorflow 2.12.0. Unfortunately, this means dropping
+    support for Python 3.7.
+
+### Fix
+
+-   Fix crashes when using ranking with very large groups.
+-   Add option to set the port used by YDF in TF-DF distributed training.
+-   Improve logging robustness.
+
+## 1.2.0 - 2023-01-24
+
+### Features
+
+-   Add support for distributed training and distributed hyper-parameter tuning
+    in the OSS build. See
+    https://www.tensorflow.org/decision_forests/distributed_training
+-   Setting "subsample" is enough enable random subsampling (to need to also set
+    "sampling_method=RANDOM").
+-   Add "min_vocab_frequency" argument in "FeatureUsage" to control the minimum
+    frequency of categorical items.
+-   Add "override_global_imputation_value" argument in "FeatureUsage" to
+    override the value used for global imputation of missing value by the
+    global-imputation algorithm.
+-   The Tuner argument "use_predefined_hps" automatically configures the set of
+    hyper-parameters to explore during automatic hyper-parameter tuning.
+-   Replaces the MEAN_MIN_DEPTH variable importance with INV_MEAN_MIN_DEPTH.
+-   Add option to forbid model inference with the slow inference engine.
+
+### Fix
+
+-   Automatic documentation generation for RandomForestModel and other classes.
+
 ## 1.1.0 - 2022-11-18
 
 ### Features

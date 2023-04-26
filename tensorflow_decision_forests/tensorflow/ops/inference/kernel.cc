@@ -42,14 +42,24 @@
 // systems are available to identify a resource: (1) a model_identifier (stored
 // as string) or (2) a model_handle (stored as a resource handle).
 //
+// Inference caches (working memory used during the infernce) are reused in
+// between prediction calls. Such memory re-use reduce the amount of heap
+// allocation. A separate cache is instantiated for each concurent prediction
+// thread with the following limitations:
+//  - No more than kMaxPreAllocatedEngineCaches caches can be kept.
+//  - Caches consuming more than kMaxPreAllocatedEngineCacheSize bytes of memory
+//    are not kept.
+//
 #include <algorithm>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/resource_mgr.h"
+#include "tensorflow/core/public/version.h"
 #include "yggdrasil_decision_forests/dataset/data_spec.h"
 #include "yggdrasil_decision_forests/dataset/data_spec.pb.h"
 #include "yggdrasil_decision_forests/model/abstract_model.h"
@@ -107,6 +117,7 @@ constexpr char kInputCategoricalSetIntFeaturesRowSplitsDim2[] =
 constexpr char kInputModelHandle[] = "model_handle";
 constexpr char kInputOutputTypes[] = "output_types";
 constexpr char kInputFilePrefix[] = "file_prefix";
+constexpr char kInputAllowSlowInference[] = "allow_slow_inference";
 
 constexpr char kOutputDensePredictions[] = "dense_predictions";
 constexpr char kOutputDenseColRepresentation[] = "dense_col_representation";
@@ -172,7 +183,9 @@ struct OutputLeavesTensors {
 };
 
 tf::Status TfStatusInvalidArgument(const absl::string_view message) {
-  return tf::Status(tf::error::INVALID_ARGUMENT, message);
+  return tf::Status(
+      static_cast<tf::errors::Code>(absl::StatusCode::kInvalidArgument),
+      message);
 }
 
 // Converts the vector of item to bitmap representation of the output types.
@@ -224,7 +237,7 @@ class FeatureIndex {
           break;
         default:
           return tf::Status(
-              tf::error::UNIMPLEMENTED,
+              static_cast<tf::errors::Code>(absl::StatusCode::kUnimplemented),
               absl::Substitute(
                   "Non supported feature type \"$0\" for feature \"$1\".",
                   dataset::proto::ColumnType_Name(feature_spec.type()),
@@ -261,7 +274,7 @@ class FeatureIndex {
 // Extracts a categorical-set-int value (i.e. a set of ints) from the tensors
 // into a std::vector<int> representation.
 //
-// By convention, a meeting value is represented as [-1].
+// By convention, a missing value is represented as [-1].
 //
 // Args:
 //   - inputs: All the input tensors.
@@ -277,8 +290,9 @@ tf::Status ExtractCategoricalSetInt(const InputTensors& inputs,
                                     std::vector<int32_t>* values) {
   if (inputs.categorical_set_int_features_row_splits_dim_2(example_idx) !=
       example_idx * feature_index.categorical_set_int_features().size()) {
-    return tf::Status(tf::error::INTERNAL,
-                      "Unexpected features_row_splits_dim_2 size.");
+    return tf::Status(
+        static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+        "Unexpected features_row_splits_dim_2 size.");
   }
 
   const int d1_cell =
@@ -286,8 +300,9 @@ tf::Status ExtractCategoricalSetInt(const InputTensors& inputs,
       tensor_col_idx;
   if (d1_cell + 1 >=
       inputs.categorical_set_int_features_row_splits_dim_1.size()) {
-    return tf::Status(tf::error::INTERNAL,
-                      "Unexpected features_row_splits_dim_1 size.");
+    return tf::Status(
+        static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+        "Unexpected features_row_splits_dim_1 size.");
   }
 
   const int begin_idx =
@@ -322,6 +337,9 @@ class AbstractInferenceEngine {
   class AbstractCache {
    public:
     virtual ~AbstractCache() = default;
+
+    // Size, in bytes, of the cache.
+    virtual uint64_t MemoryUsage() const = 0;
   };
 
   // Creates a cache: one per inference op instance.
@@ -352,6 +370,8 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
       : model_(std::move(model)) {}
 
   class Cache : public AbstractCache {
+    uint64_t MemoryUsage() const override { return dataset_.MemoryUsage(); }
+
    private:
     dataset::VerticalDataset dataset_;
 
@@ -372,7 +392,9 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
     // Update the vertical dataset with the input tensors.
     auto* cache = dynamic_cast<Cache*>(abstract_cache);
     if (cache == nullptr) {
-      return tf::Status(tf::error::INTERNAL, "Unexpected cache type.");
+      return tf::Status(
+          static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+          "Unexpected cache type.");
     }
     TF_RETURN_IF_ERROR(SetVerticalDataset(inputs, feature_index, cache));
 
@@ -397,8 +419,9 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
           if (outputs->output_dim == 1 && !output_is_proba) {
             // Output the logit of the positive class.
             if (pred.distribution().counts().size() != 3) {
-              return tf::Status(tf::error::INTERNAL,
-                                "Wrong \"distribution\" shape.");
+              return tf::Status(
+                  static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+                  "Wrong \"distribution\" shape.");
             }
             const float logit =
                 prediction.classification().distribution().counts(2) /
@@ -408,8 +431,9 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
             // Output the logit or probabilities.
             if (outputs->dense_predictions.dimension(1) !=
                 pred.distribution().counts().size() - 1) {
-              return tf::Status(tf::error::INTERNAL,
-                                "Wrong \"distribution\" shape.");
+              return tf::Status(
+                  static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+                  "Wrong \"distribution\" shape.");
             }
             for (int class_idx = 0; class_idx < outputs->output_dim;
                  class_idx++) {
@@ -444,8 +468,9 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
           const auto& pred = prediction.uplift();
           if (outputs->dense_predictions.dimension(1) !=
               pred.treatment_effect_size()) {
-            return tf::Status(tf::error::INTERNAL,
-                              "Wrong \"distribution\" shape.");
+            return tf::Status(
+                static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+                "Wrong \"distribution\" shape.");
           }
           for (int uplift_idx = 0; uplift_idx < outputs->output_dim;
                uplift_idx++) {
@@ -455,9 +480,10 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
         } break;
 
         default:
-          return tf::Status(tf::error::UNIMPLEMENTED,
-                            absl::Substitute("Non supported task $0",
-                                             Task_Name(model_->task())));
+          return tf::Status(
+              static_cast<tf::errors::Code>(absl::StatusCode::kUnimplemented),
+              absl::Substitute("Non supported task $0",
+                               Task_Name(model_->task())));
       }
     }
 
@@ -471,7 +497,9 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
     // Update the vertical dataset with the input tensors.
     auto* cache = dynamic_cast<Cache*>(abstract_cache);
     if (cache == nullptr) {
-      return tf::Status(tf::error::INTERNAL, "Unexpected cache type.");
+      return tf::Status(
+          static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+          "Unexpected cache type.");
     }
     TF_RETURN_IF_ERROR(SetVerticalDataset(inputs, feature_index, cache));
 
@@ -534,7 +562,9 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
               dataset::NumericalToDiscretizedNumerical(col_spec, value);
         }
       } else {
-        return tf::Status(tf::error::INTERNAL, "Unexpected column type.");
+        return tf::Status(
+            static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+            "Unexpected column type.");
       }
     }
 
@@ -545,7 +575,9 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
       auto* col = cache->dataset_.MutableColumnWithCastOrNull<
           dataset::VerticalDataset::BooleanColumn>(feature_idx);
       if (col == nullptr) {
-        return tf::Status(tf::error::INTERNAL, "Unexpected column type.");
+        return tf::Status(
+            static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+            "Unexpected column type.");
       }
       col->Resize(inputs.batch_size);
       auto& dst = *col->mutable_values();
@@ -571,7 +603,9 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
       auto* col = cache->dataset_.MutableColumnWithCastOrNull<
           dataset::VerticalDataset::CategoricalColumn>(feature_idx);
       if (col == nullptr) {
-        return tf::Status(tf::error::INTERNAL, "Unexpected column type.");
+        return tf::Status(
+            static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+            "Unexpected column type.");
       }
       col->Resize(inputs.batch_size);
       const int max_value = cache->dataset_.data_spec()
@@ -606,7 +640,9 @@ class GenericInferenceEngine : public AbstractInferenceEngine {
       auto* col = cache->dataset_.MutableColumnWithCastOrNull<
           dataset::VerticalDataset::CategoricalSetColumn>(feature_idx);
       if (col == nullptr) {
-        return tf::Status(tf::error::INTERNAL, "Unexpected column type.");
+        return tf::Status(
+            static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+            "Unexpected column type.");
       }
       col->Resize(inputs.batch_size);
 
@@ -653,6 +689,14 @@ class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
   }
 
   class Cache : public AbstractCache {
+    uint64_t MemoryUsage() const override {
+      uint64_t usage = predictions_.size() * sizeof(float);
+      if (examples_) {
+        usage += examples_->MemoryUsage();
+      }
+      return usage;
+    }
+
    private:
     // Cache of pre-allocated predictions.
     std::vector<float> predictions_;
@@ -693,7 +737,9 @@ class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
     // Update the vertical dataset with the input tensors.
     auto* cache = dynamic_cast<Cache*>(abstract_cache);
     if (cache == nullptr) {
-      return tf::Status(tf::error::INTERNAL, "Unexpected cache type.");
+      return tf::Status(
+          static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+          "Unexpected cache type.");
     }
 
     TF_RETURN_IF_ERROR(SetInputFeatures(inputs, feature_index, cache));
@@ -706,7 +752,9 @@ class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
     if (decompact_probability_) {
       DCHECK_EQ(outputs->output_dim, 2);
       if (engine_->NumPredictionDimension() != 1) {
-        return tf::Status(tf::error::INTERNAL, "Wrong NumPredictionDimension");
+        return tf::Status(
+            static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+            "Wrong NumPredictionDimension");
       }
       for (int example_idx = 0; example_idx < inputs.batch_size;
            example_idx++) {
@@ -718,7 +766,9 @@ class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
 
     } else {
       if (engine_->NumPredictionDimension() != outputs->output_dim) {
-        return tf::Status(tf::error::INTERNAL, "Wrong NumPredictionDimension");
+        return tf::Status(
+            static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+            "Wrong NumPredictionDimension");
       }
       for (int example_idx = 0; example_idx < inputs.batch_size;
            example_idx++) {
@@ -740,7 +790,9 @@ class SemiFastGenericInferenceEngine : public AbstractInferenceEngine {
     // Update the vertical dataset with the input tensors.
     auto* cache = dynamic_cast<Cache*>(abstract_cache);
     if (cache == nullptr) {
-      return tf::Status(tf::error::INTERNAL, "Unexpected cache type.");
+      return tf::Status(
+          static_cast<tf::errors::Code>(absl::StatusCode::kInternal),
+          "Unexpected cache type.");
     }
     TF_RETURN_IF_ERROR(SetInputFeatures(inputs, feature_index, cache));
 
@@ -964,7 +1016,8 @@ class YggdrasilModelResource : public tf::ResourceBase {
   // Loads the model from disk.
   tf::Status LoadModelFromDisk(const absl::string_view model_path,
                                const std::string& file_prefix,
-                               const OutputTypesBitmap& output_types = {}) {
+                               const OutputTypesBitmap& output_types = {},
+                               const bool allow_slow_inference = true) {
     std::unique_ptr<model::AbstractModel> model;
     TF_RETURN_IF_ERROR(utils::FromUtilStatus(
         LoadModel(model_path, &model, {/*.file_prefix=*/file_prefix})));
@@ -983,7 +1036,8 @@ class YggdrasilModelResource : public tf::ResourceBase {
     }
 
     // WARNING: After this function, the "model" might not be available anymore.
-    TF_RETURN_IF_ERROR(CreateInferenceEngine(output_types, std::move(model)));
+    TF_RETURN_IF_ERROR(CreateInferenceEngine(output_types, allow_slow_inference,
+                                             std::move(model)));
     return tf::OkStatus();
   }
 
@@ -1005,7 +1059,7 @@ class YggdrasilModelResource : public tf::ResourceBase {
   // Creates an inference engine compatible with the model. The inference engine
   // can take ownership of the abstract model data.
   tf::Status CreateInferenceEngine(
-      const OutputTypesBitmap& output_types,
+      const OutputTypesBitmap& output_types, const bool allow_slow_inference,
       std::unique_ptr<model::AbstractModel> model) {
     // Currently, none of the fast engines support leaves output.
     if (!output_types.leaves) {
@@ -1018,13 +1072,25 @@ class YggdrasilModelResource : public tf::ResourceBase {
         TF_RETURN_IF_ERROR(
             utils::FromUtilStatus(inference_engine_or_status.status()));
         inference_engine_ = std::move(inference_engine_or_status.value());
-        LOG(INFO) << "Use fast generic engine";
+        YDF_LOG(INFO) << "Use fast generic engine";
         return tf::OkStatus();
+      }
+
+      if (!allow_slow_inference) {
+        return ::tensorflow::Status(
+            static_cast<tf::errors::Code>(absl::StatusCode::kUnknown),
+            "No compatible fast inference engine found for the model. Options: "
+            "1) Make sure this binary is compiled with support with compatible "
+            "fast inference engines. 2) Allow for the model to run with the "
+            "slow inference engine with allow_slow_inference=true, 3) Modify "
+            "the model to make sure it is compatible with inference engines. "
+            "Some rarely used hyper-parameters can cause incompatibility with "
+            "fast inference engines.");
       }
     }
 
     // Slow generic engine.
-    LOG(INFO) << "Use slow generic engine";
+    YDF_LOG(INFO) << "Use slow generic engine";
     inference_engine_ =
         absl::make_unique<GenericInferenceEngine>(std::move(model));
     return tf::OkStatus();
@@ -1121,7 +1187,7 @@ class SimpleMLLoadModelFromPath : public OpKernel {
               ->Lookup(kModelContainer, model_identifier_, &maybe_resource)
               .ok()) {
         maybe_resource->Unref();
-        LOG(WARNING) << "Model " << model_identifier_ << " already loaded";
+        YDF_LOG(WARNING) << "Model " << model_identifier_ << " already loaded";
         return;
       }
     }
@@ -1162,6 +1228,8 @@ class SimpleMLLoadModelFromPathWithHandle : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->GetAttr(kInputOutputTypes, &output_types));
     OP_REQUIRES_OK(ctx, GetOutputTypesBitmap(output_types, &output_types_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr(kInputFilePrefix, &file_prefix_));
+    OP_REQUIRES_OK(
+        ctx, ctx->GetAttr(kInputAllowSlowInference, &allow_slow_inference_));
   }
 
   void Compute(OpKernelContext* ctx) override {
@@ -1172,15 +1240,17 @@ class SimpleMLLoadModelFromPathWithHandle : public OpKernel {
     OP_REQUIRES_OK(ctx, GetModel(ctx, &model_container));
     tf::core::ScopedUnref unref_me(model_container);
 
-    LOG(INFO) << "Loading model from path " << model_path << " with prefix "
-              << file_prefix_;
+    YDF_LOG(INFO) << "Loading model from path " << model_path << " with prefix "
+                  << file_prefix_;
     OP_REQUIRES_OK(ctx, model_container->LoadModelFromDisk(
-                            model_path, file_prefix_, output_types_));
+                            model_path, file_prefix_, output_types_,
+                            allow_slow_inference_));
   }
 
  private:
   OutputTypesBitmap output_types_;
   std::string file_prefix_;
+  bool allow_slow_inference_;
 };
 
 REGISTER_KERNEL_BUILDER(
@@ -1281,7 +1351,11 @@ class SimpleMLInferenceOp : public OpKernel {
     if (!lookup_status.ok()) {
       return tf::Status(
           lookup_status.code(),
+#if TF_GRAPH_DEF_VERSION < 1467
           absl::StrCat(lookup_status.error_message(),
+#else
+          absl::StrCat(lookup_status.message(),
+#endif
                        ". This error caused the simpleML model not to be "
                        "available for inference. This error is likely due to "
                        "the \"LoadModel*\" not having been run before."));
@@ -1453,6 +1527,10 @@ class SimpleMLInferenceOp : public OpKernel {
 
   void ReturnEngineCache(
       std::unique_ptr<AbstractInferenceEngine::AbstractCache>&& cache) {
+    if (cache->MemoryUsage() > kMaxPreAllocatedEngineCacheSize) {
+      // The cache is too large for being kept.
+      return;
+    }
     tf::mutex_lock lock_engine_mutex(engine_cache_mutex_);
     if (engine_caches_.size() < kMaxPreAllocatedEngineCaches) {
       engine_caches_.push_back(std::move(cache));
@@ -1466,6 +1544,11 @@ class SimpleMLInferenceOp : public OpKernel {
   // "kMaxPreAllocatedEngineCaches" engine caches can be allocated at one time.
   // However, these engine cache will be deallocated after being used.
   static constexpr int kMaxPreAllocatedEngineCaches = 32;
+
+  // Maximum size, in bytes, of the engine cache objects to keep in memory to
+  // avoid excessive heap allocations. Cache items greater than this value are
+  // discarded after been used (instead of being kept for later reuse).
+  static constexpr int kMaxPreAllocatedEngineCacheSize = 10e6;  // 10MB
 
   // Identifier of the model. Copy of the "model_identifier" attribute.
   std::string model_identifier_;
